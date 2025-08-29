@@ -1,3 +1,7 @@
+<div align="center">
+<img width="384" height="256" alt="gt-banner" src="https://github.com/user-attachments/assets/4c7f4243-f432-4d3b-bc86-16e3f11c1528" />
+</div>
+
 # gt - Git Worktree Manager
 
 > A blazing fast TUI for managing Git worktrees with zero friction
