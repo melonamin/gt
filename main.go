@@ -517,6 +517,56 @@ func getShell(config *Config) string {
 	return "/bin/bash"
 }
 
+func ensureGitignoreEntry(repoPath, entry string) error {
+	gitignorePath := filepath.Join(repoPath, ".gitignore")
+	
+	// Ensure entry ends with / if it's a directory
+	if !strings.HasSuffix(entry, "/") {
+		entry = entry + "/"
+	}
+	
+	// Read existing .gitignore content
+	content, err := os.ReadFile(gitignorePath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	
+	// Check if entry already exists
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == entry || trimmed == strings.TrimRight(entry, "/") {
+			// Entry already exists
+			return nil
+		}
+	}
+	
+	// Add entry to .gitignore
+	newContent := string(content)
+	if len(content) > 0 && !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+	
+	// Add a comment if this is the first worktree entry
+	hasWorktreeComment := false
+	for _, line := range lines {
+		if strings.Contains(line, "Git worktrees") {
+			hasWorktreeComment = true
+			break
+		}
+	}
+	
+	if !hasWorktreeComment && len(content) > 0 {
+		newContent += "\n# Git worktrees\n"
+	} else if len(content) == 0 {
+		newContent = "# Git worktrees\n"
+	}
+	
+	newContent += entry + "\n"
+	
+	return os.WriteFile(gitignorePath, []byte(newContent), 0644)
+}
+
 func createWorktree(repoPath, branch string, config *Config) error {
 	// Determine worktree directory
 	worktreeDir := defaultWorktreeDir
@@ -532,6 +582,18 @@ func createWorktree(repoPath, branch string, config *Config) error {
 	// Create worktree directory if it doesn't exist
 	if err := os.MkdirAll(worktreeDir, 0755); err != nil {
 		return err
+	}
+
+	// Add worktree directory to .gitignore if it's within the repo
+	if strings.HasPrefix(worktreeDir, repoPath) {
+		relPath, _ := filepath.Rel(repoPath, worktreeDir)
+		if relPath != "" && !strings.HasPrefix(relPath, "..") {
+			if err := ensureGitignoreEntry(repoPath, relPath); err != nil {
+				// Don't fail the worktree creation if we can't update .gitignore
+				// Just continue with a warning
+				fmt.Fprintf(os.Stderr, "Warning: Could not update .gitignore: %v\n", err)
+			}
+		}
 	}
 
 	// Generate worktree path
