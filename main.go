@@ -16,7 +16,7 @@ import (
 const (
 	defaultWorktreeDir = ".worktrees"
 	configFileName     = "config.json"
-	configDirName      = "worktree-manager"
+	configDirName      = "gt"
 )
 
 type Config struct {
@@ -567,6 +567,55 @@ func ensureGitignoreEntry(repoPath, entry string) error {
 	return os.WriteFile(gitignorePath, []byte(newContent), 0644)
 }
 
+func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, config *Config) error {
+	// Determine worktree directory
+	worktreeDir := defaultWorktreeDir
+	if config != nil && config.WorktreeDir != "" {
+		worktreeDir = config.WorktreeDir
+	}
+
+	// Handle absolute vs relative paths
+	if !filepath.IsAbs(worktreeDir) {
+		worktreeDir = filepath.Join(repoPath, worktreeDir)
+	}
+
+	// Create worktree directory if it doesn't exist
+	if err := os.MkdirAll(worktreeDir, 0755); err != nil {
+		return err
+	}
+
+	// Add worktree directory to .gitignore if it's within the repo
+	if strings.HasPrefix(worktreeDir, repoPath) {
+		relPath, _ := filepath.Rel(repoPath, worktreeDir)
+		if relPath != "" && !strings.HasPrefix(relPath, "..") {
+			if err := ensureGitignoreEntry(repoPath, relPath); err != nil {
+				// Don't fail the worktree creation if we can't update .gitignore
+				// Just continue with a warning
+				fmt.Fprintf(os.Stderr, "Warning: Could not update .gitignore: %v\n", err)
+			}
+		}
+	}
+
+	// Generate worktree path
+	worktreePath := filepath.Join(worktreeDir, strings.ReplaceAll(worktreeName, "/", "-"))
+
+	// Create worktree with new branch from source branch
+	cmd := exec.Command("git", "worktree", "add", "-b", worktreeName, worktreePath, sourceBranch)
+	cmd.Dir = repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// If branch already exists, try without -b flag
+		cmd = exec.Command("git", "worktree", "add", worktreePath, worktreeName)
+		cmd.Dir = repoPath
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to create worktree: %s", string(output))
+		}
+	}
+
+	return nil
+}
+
 func createWorktree(repoPath, branch string, config *Config) error {
 	// Determine worktree directory
 	worktreeDir := defaultWorktreeDir
@@ -753,7 +802,141 @@ func (m model) View() string {
 	return s.String()
 }
 
+func printHelp() {
+	help := `gt - Git Worktree Manager
+
+USAGE:
+    gt                           Open interactive worktree manager
+    gt <name>                    Create worktree from current branch and switch to it
+    gt <name> <branch>           Create worktree from specified branch and switch to it
+    gt -h, --help                Show this help message
+
+EXAMPLES:
+    gt                           # Open TUI to manage worktrees
+    gt feature-xyz               # Create worktree 'feature-xyz' from current branch
+    gt fix-bug main              # Create worktree 'fix-bug' from 'main' branch
+
+INTERACTIVE MODE COMMANDS:
+    n        Create new worktree
+    d        Delete selected worktree
+    enter    Switch to selected worktree
+    /        Search worktrees
+    r        Refresh list
+    q        Quit
+
+CONFIGURATION:
+    Config file: ~/.config/gt/config.json
+    
+    Options:
+    - worktree_dir: Directory for worktrees (default: .worktrees)
+    - shell: Shell to use when switching (default: $SHELL or /bin/bash)
+`
+	fmt.Print(help)
+}
+
+func getCurrentBranch(repoPath string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Dir = repoPath
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func switchToWorktree(worktreePath string, config *Config) error {
+	// Change to the worktree directory
+	if err := os.Chdir(worktreePath); err != nil {
+		return err
+	}
+	
+	fmt.Printf("\033[2mSwitched to %s\033[0m\n", worktreePath)
+	
+	// Start a new shell in the worktree directory
+	shell := getShell(config)
+	cmd := exec.Command(shell)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Dir = worktreePath
+	
+	return cmd.Run()
+}
+
 func main() {
+	// Parse command-line arguments
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-h", "--help", "help":
+			printHelp()
+			os.Exit(0)
+		default:
+			// Handle worktree creation
+			worktreeName := os.Args[1]
+			var sourceBranch string
+			
+			// Get repo path
+			repoPath, err := getCurrentRepoPath()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			
+			// Load config
+			config, _ := loadConfig()
+			if config == nil {
+				config = &Config{}
+			}
+			
+			// Determine source branch
+			if len(os.Args) > 2 {
+				sourceBranch = os.Args[2]
+			} else {
+				// Use current branch
+				sourceBranch, err = getCurrentBranch(repoPath)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting current branch: %v\n", err)
+					os.Exit(1)
+				}
+			}
+			
+			// Create the worktree
+			fmt.Printf("Creating worktree '%s' from branch '%s'...\n", worktreeName, sourceBranch)
+			
+			// First check if we need to create from an existing branch or create new
+			if sourceBranch != worktreeName {
+				// Create worktree from existing branch
+				err = createWorktreeFromBranch(repoPath, worktreeName, sourceBranch, config)
+			} else {
+				// Create new branch with worktree
+				err = createWorktree(repoPath, worktreeName, config)
+			}
+			
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating worktree: %v\n", err)
+				os.Exit(1)
+			}
+			
+			// Determine worktree path
+			worktreeDir := defaultWorktreeDir
+			if config != nil && config.WorktreeDir != "" {
+				worktreeDir = config.WorktreeDir
+			}
+			if !filepath.IsAbs(worktreeDir) {
+				worktreeDir = filepath.Join(repoPath, worktreeDir)
+			}
+			worktreePath := filepath.Join(worktreeDir, strings.ReplaceAll(worktreeName, "/", "-"))
+			
+			// Switch to the new worktree
+			if err := switchToWorktree(worktreePath, config); err != nil {
+				fmt.Fprintf(os.Stderr, "Error switching to worktree: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		}
+	}
+	
+	// No arguments - run interactive mode
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
