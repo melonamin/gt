@@ -16,6 +16,13 @@ Instantly manage all your Git worktrees with:
 
 ## Installation
 
+### Homebrew (macOS)
+
+```bash
+brew tap melonamin/formulae
+brew install gt
+```
+
 ### Download Pre-built Binaries
 
 Download the latest release from [GitHub Releases](https://github.com/melonamin/gt/releases):
@@ -67,9 +74,9 @@ Each branch gets its own working directory. Switch instantly, no stashing:
 ```bash
 $ gt
 → main               ✓  Initial commit (2 hours ago)
-  feature-auth       ●  Add OAuth implementation (3 days ago)  
+  feature-auth       ●  Add OAuth implementation (3 days ago)
   fix-memory-leak    ✓  Fix connection pooling (1 week ago)
-  
+
 [n]ew  [d]elete  [enter] switch  [/] search  [q]uit
 ```
 
@@ -209,19 +216,19 @@ Git worktrees let you have multiple working directories for the same repository.
 
 ## FAQ
 
-**Q: How is this different from just using `git worktree`?**  
+**Q: How is this different from just using `git worktree`?**
 A: `gt` is to `git worktree` what `tig` is to `git log`. It makes the powerful feature actually pleasant to use.
 
-**Q: Where are my worktrees stored?**  
+**Q: Where are my worktrees stored?**
 A: By default in `.worktrees/` within your repo. This is configurable and automatically added to `.gitignore`.
 
-**Q: Can I use my existing worktrees?**  
+**Q: Can I use my existing worktrees?**
 A: Yes! `gt` shows all worktrees, regardless of where they were created.
 
-**Q: What happens to the worktree when I delete a branch?**  
+**Q: What happens to the worktree when I delete a branch?**
 A: The worktree remains but becomes detached. You can delete it with `gt` (press `d` in the TUI).
 
-**Q: Does this work with bare repositories?**  
+**Q: Does this work with bare repositories?**
 A: Yes, it works with any Git repository structure.
 
 ## Philosophy
