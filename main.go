@@ -14,6 +14,7 @@ import (
 )
 
 const (
+	version            = "0.1.0"
 	defaultWorktreeDir = ".worktrees"
 	configFileName     = "config.json"
 	configDirName      = "gt"
@@ -803,13 +804,14 @@ func (m model) View() string {
 }
 
 func printHelp() {
-	help := `gt - Git Worktree Manager
+	help := fmt.Sprintf(`gt - Git Worktree Manager v%s
 
 USAGE:
     gt                           Open interactive worktree manager
     gt <name>                    Create worktree from current branch and switch to it
     gt <name> <branch>           Create worktree from specified branch and switch to it
     gt -h, --help                Show this help message
+    gt -v, --version             Show version information
 
 EXAMPLES:
     gt                           # Open TUI to manage worktrees
@@ -830,7 +832,7 @@ CONFIGURATION:
     Options:
     - worktree_dir: Directory for worktrees (default: .worktrees)
     - shell: Shell to use when switching (default: $SHELL or /bin/bash)
-`
+`, version)
 	fmt.Print(help)
 }
 
@@ -869,6 +871,9 @@ func main() {
 		switch os.Args[1] {
 		case "-h", "--help", "help":
 			printHelp()
+			os.Exit(0)
+		case "-v", "--version", "version":
+			fmt.Printf("gt version %s\n", version)
 			os.Exit(0)
 		default:
 			// Handle worktree creation
