@@ -36,9 +36,10 @@ const (
 
 // Config holds user configuration loaded from ~/.config/gt/config.json.
 type Config struct {
-	WorktreeDir string `json:"worktree_dir,omitempty"`
-	Shell       string `json:"shell,omitempty"`
-	PostCreate  string `json:"post_create,omitempty"`
+	WorktreeDir          string `json:"worktree_dir,omitempty"`
+	Shell                string `json:"shell,omitempty"`
+	PostCreate           string `json:"post_create,omitempty"`
+	DefaultMergeStrategy string `json:"default_merge_strategy,omitempty"` // "squash" or "ff-only"
 }
 
 // Worktree represents a git worktree with its associated metadata.
@@ -65,11 +66,13 @@ type CommitInfo struct {
 type inputMode int
 
 const (
-	modeNormal    inputMode = iota // Browsing worktrees
-	modeSearch                     // Inline search filtering
-	modeNewBranch                  // Entering new branch name
-	modeNewPath                    // Entering custom worktree path
-	modeActions                    // Selecting from actions menu
+	modeNormal        inputMode = iota // Browsing worktrees
+	modeSearch                         // Inline search filtering
+	modeNewBranch                      // Entering new branch name
+	modeNewPath                        // Entering custom worktree path
+	modeActions                        // Selecting from actions menu
+	modeMergeStrategy                  // Selecting merge strategy
+	modeMergeConfirm                   // Confirming merge operation
 )
 
 // actionFn is the signature for worktree action handlers.
@@ -115,12 +118,19 @@ type deleteState struct {
 	target     *Worktree
 }
 
+// mergeState holds the state for merge-and-delete confirmation flow.
+type mergeState struct {
+	target   *Worktree
+	strategy string // "squash" or "ff-only"
+}
+
 // model is the Bubble Tea model for the TUI application.
 type model struct {
 	ui       uiState
 	wt       worktreeState
 	acts     actionsState
 	del      deleteState
+	merge    mergeState
 	repoPath string
 	config   *Config
 	err      error
@@ -142,7 +152,7 @@ var (
 			Foreground(lipgloss.Color("86"))
 
 	dimStyle = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("240"))
+			Foreground(lipgloss.Color("240"))
 
 	selectedStyle = lipgloss.NewStyle().
 			Background(lipgloss.Color("236")).
@@ -160,7 +170,7 @@ var (
 			Bold(true)
 
 	helpStyle = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("240"))
+			Foreground(lipgloss.Color("240"))
 
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196")).
@@ -760,6 +770,51 @@ func (m model) handleActionsMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// handleMergeStrategyMode handles key input during merge strategy selection.
+func (m model) handleMergeStrategyMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c", "q":
+		m.ui.inputMode = modeNormal
+		m.merge.target = nil
+		m.merge.strategy = ""
+		return m, nil
+	case "s", "S":
+		m.merge.strategy = "squash"
+		m.ui.inputMode = modeMergeConfirm
+		return m, nil
+	case "f", "F":
+		m.merge.strategy = "ff-only"
+		m.ui.inputMode = modeMergeConfirm
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleMergeConfirmMode handles key input during merge confirmation.
+func (m model) handleMergeConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		if m.merge.target != nil {
+			if err := mergeAndDeleteWorktree(m.repoPath, m.merge.target, m.wt.defaultBranch, m.merge.strategy); err != nil {
+				m.err = err
+			} else {
+				m.setStatus(fmt.Sprintf("Merged '%s' into '%s' and deleted worktree", m.merge.target.Branch, m.wt.defaultBranch), statusMessageTimeout)
+				m.refreshWorktrees()
+			}
+		}
+		m.ui.inputMode = modeNormal
+		m.merge.target = nil
+		m.merge.strategy = ""
+		return m, tickCmd()
+	case "n", "N", "esc", "ctrl+c":
+		m.ui.inputMode = modeNormal
+		m.merge.target = nil
+		m.merge.strategy = ""
+		return m, nil
+	}
+	return m, nil
+}
+
 // handleNormalMode handles key input during normal browsing mode.
 func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -850,6 +905,27 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "m":
+		if m.ui.cursor < len(m.wt.filtered) {
+			wt := &m.wt.filtered[m.ui.cursor]
+			// Validate before showing strategy picker
+			if strings.HasSuffix(m.repoPath, wt.Path) {
+				m.err = fmt.Errorf("cannot merge main worktree")
+				return m, nil
+			}
+			if wt.Branch == m.wt.defaultBranch {
+				m.err = fmt.Errorf("cannot merge default branch into itself")
+				return m, nil
+			}
+			if wt.IsCurrent {
+				m.err = fmt.Errorf("cannot merge currently checked out worktree")
+				return m, nil
+			}
+			m.merge.target = wt
+			m.ui.inputMode = modeMergeStrategy
+		}
+		return m, nil
+
 	case "enter":
 		if m.ui.cursor < len(m.wt.filtered) {
 			wt := m.wt.filtered[m.ui.cursor]
@@ -918,6 +994,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleNewBranchMode(msg)
 		case modeActions:
 			return m.handleActionsMode(msg)
+		case modeMergeStrategy:
+			return m.handleMergeStrategyMode(msg)
+		case modeMergeConfirm:
+			return m.handleMergeConfirmMode(msg)
 		default:
 			return m.handleNormalMode(msg)
 		}
@@ -938,18 +1018,18 @@ func getShell(config *Config) string {
 
 func ensureGitignoreEntry(repoPath, entry string) error {
 	gitignorePath := filepath.Join(repoPath, ".gitignore")
-	
+
 	// Ensure entry ends with / if it's a directory
 	if !strings.HasSuffix(entry, "/") {
 		entry = entry + "/"
 	}
-	
+
 	// Read existing .gitignore content
 	content, err := os.ReadFile(gitignorePath)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	
+
 	// Check if entry already exists
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
@@ -959,13 +1039,13 @@ func ensureGitignoreEntry(repoPath, entry string) error {
 			return nil
 		}
 	}
-	
+
 	// Add entry to .gitignore
 	newContent := string(content)
 	if len(content) > 0 && !strings.HasSuffix(newContent, "\n") {
 		newContent += "\n"
 	}
-	
+
 	// Add a comment if this is the first worktree entry
 	hasWorktreeComment := false
 	for _, line := range lines {
@@ -974,15 +1054,15 @@ func ensureGitignoreEntry(repoPath, entry string) error {
 			break
 		}
 	}
-	
+
 	if !hasWorktreeComment && len(content) > 0 {
 		newContent += "\n# Git worktrees\n"
 	} else if len(content) == 0 {
 		newContent = "# Git worktrees\n"
 	}
-	
+
 	newContent += entry + "\n"
-	
+
 	return os.WriteFile(gitignorePath, []byte(newContent), 0644)
 }
 
@@ -1106,6 +1186,150 @@ func deleteWorktree(repoPath, worktreePath string) error {
 	return nil
 }
 
+// canFastForward checks if sourceBranch can be fast-forwarded into targetBranch.
+// Returns true if targetBranch is an ancestor of sourceBranch.
+func canFastForward(repoPath, sourceBranch, targetBranch string) (bool, error) {
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", targetBranch, sourceBranch)
+	cmd.Dir = repoPath
+	err := cmd.Run()
+	if err != nil {
+		// Exit code 1 means not an ancestor (not a fast-forward)
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// canMergeWorktree checks if a worktree can be merged into the default branch.
+// Returns detailed status for user feedback.
+func canMergeWorktree(repoPath string, wt *Worktree, defaultBranch string) (canFF bool, ahead, behind int, hasChanges bool, err error) {
+	// Check for uncommitted changes
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = wt.Path
+	output, err := cmd.Output()
+	if err != nil {
+		return false, 0, 0, false, fmt.Errorf("failed to check status: %w", err)
+	}
+	hasChanges = len(strings.TrimSpace(string(output))) > 0
+
+	// Get ahead/behind counts
+	ahead, behind = getAheadBehind(wt.Path, wt.Branch, defaultBranch)
+
+	// Check if fast-forward is possible
+	canFF, err = canFastForward(repoPath, wt.Branch, defaultBranch)
+	if err != nil {
+		return false, ahead, behind, hasChanges, fmt.Errorf("failed to check fast-forward: %w", err)
+	}
+
+	return canFF, ahead, behind, hasChanges, nil
+}
+
+// mergeWorktreeBranch performs the merge operation.
+func mergeWorktreeBranch(repoPath, branch, defaultBranch, strategy string) error {
+	// Checkout the default branch
+	cmd := exec.Command("git", "checkout", defaultBranch)
+	cmd.Dir = repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to checkout %s: %s", defaultBranch, string(output))
+	}
+
+	// Perform the merge based on strategy
+	switch strategy {
+	case "squash":
+		cmd = exec.Command("git", "merge", "--squash", branch)
+		cmd.Dir = repoPath
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to squash merge: %s", string(output))
+		}
+		// Commit the squashed changes
+		commitMsg := fmt.Sprintf("Squash merge branch '%s'", branch)
+		cmd = exec.Command("git", "commit", "-m", commitMsg)
+		cmd.Dir = repoPath
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to commit squash merge: %s", string(output))
+		}
+	case "ff-only":
+		cmd = exec.Command("git", "merge", "--ff-only", branch)
+		cmd.Dir = repoPath
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to fast-forward merge: %s", string(output))
+		}
+	default:
+		return fmt.Errorf("unknown merge strategy: %s", strategy)
+	}
+
+	return nil
+}
+
+// deleteBranchAfterMerge deletes the branch after a successful merge.
+func deleteBranchAfterMerge(repoPath, branch string, wasSquash bool) error {
+	// Use -D for squash (no merge commit means -d would fail)
+	// Use -d for ff-only (safe delete)
+	flag := "-d"
+	if wasSquash {
+		flag = "-D"
+	}
+	cmd := exec.Command("git", "branch", flag, branch)
+	cmd.Dir = repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to delete branch: %s", string(output))
+	}
+	return nil
+}
+
+// mergeAndDeleteWorktree orchestrates the full merge and delete workflow.
+func mergeAndDeleteWorktree(repoPath string, wt *Worktree, defaultBranch, strategy string) error {
+	// Pre-flight checks
+	canFF, ahead, behind, hasChanges, err := canMergeWorktree(repoPath, wt, defaultBranch)
+	if err != nil {
+		return err
+	}
+
+	if hasChanges {
+		return errors.New("worktree has uncommitted changes - commit or stash first")
+	}
+
+	if wt.Branch == defaultBranch {
+		return errors.New("cannot merge default branch into itself")
+	}
+
+	if ahead == 0 {
+		return errors.New("branch has no new commits to merge")
+	}
+
+	if strategy == "ff-only" && !canFF {
+		if behind > 0 {
+			return fmt.Errorf("branch is behind %s by %d commits - rebase first", defaultBranch, behind)
+		}
+		return errors.New("fast-forward not possible - branches have diverged")
+	}
+
+	// Step 1: Remove the worktree (so branch is not checked out)
+	if err := deleteWorktree(repoPath, wt.Path); err != nil {
+		return fmt.Errorf("failed to remove worktree: %w", err)
+	}
+
+	// Step 2: Perform the merge
+	if err := mergeWorktreeBranch(repoPath, wt.Branch, defaultBranch, strategy); err != nil {
+		return fmt.Errorf("merge failed: %w", err)
+	}
+
+	// Step 3: Delete the branch
+	if err := deleteBranchAfterMerge(repoPath, wt.Branch, strategy == "squash"); err != nil {
+		// Don't fail completely - worktree is already deleted and merge succeeded
+		return fmt.Errorf("merged successfully but failed to delete branch: %w", err)
+	}
+
+	return nil
+}
+
 func (m model) View() string {
 	if m.err != nil {
 		return errorStyle.Render(fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err))
@@ -1140,6 +1364,24 @@ func (m model) View() string {
 				}
 			}
 			s.WriteString(helpStyle.Render("\n[enter] select  [esc] cancel\n"))
+		}
+		return s.String()
+	case modeMergeStrategy:
+		if m.merge.target != nil {
+			s.WriteString(searchStyle.Render(fmt.Sprintf("Merge '%s' into '%s':\n\n", m.merge.target.Branch, m.wt.defaultBranch)))
+			s.WriteString("  [s] Squash      - combine all commits into one\n")
+			s.WriteString("  [f] Fast-forward - keep commit history\n")
+			s.WriteString(helpStyle.Render("\n[esc] cancel\n"))
+		}
+		return s.String()
+	case modeMergeConfirm:
+		if m.merge.target != nil {
+			strategyLabel := "fast-forward"
+			if m.merge.strategy == "squash" {
+				strategyLabel = "squash"
+			}
+			s.WriteString(errorStyle.Render(fmt.Sprintf("\nMerge '%s' into '%s' using %s and delete? [y/N] ",
+				m.merge.target.Branch, m.wt.defaultBranch, strategyLabel)))
 		}
 		return s.String()
 	default:
@@ -1239,7 +1481,7 @@ func (m model) View() string {
 	// Help
 	s.WriteString("\n")
 	if m.ui.inputMode == modeNormal {
-		help := "[n]ew  [d]elete  [a]ctions  [enter] switch  [/] search  [r]efresh  [^] default  [-] prev  [@] current  [q]uit"
+		help := "[n]ew  [d]elete  [m]erge  [a]ctions  [enter] switch  [/] search  [r]efresh  [^] default  [-] prev  [@] current  [q]uit"
 		s.WriteString(helpStyle.Render(help))
 	} else {
 		help := "[enter] confirm  [esc] cancel"
@@ -1350,12 +1592,16 @@ USAGE:
     gt <name>                    Create worktree from current branch and switch to it
     gt <name> <branch>           Create worktree from specified branch and switch to it
     gt <name> -x <cmd>           Create worktree and execute command instead of shell
+    gt --merge <branch>          Merge worktree branch into default and delete
     gt completion <shell>        Generate shell completion script (bash, zsh, fish)
     gt -h, --help                Show this help message
     gt -v, --version             Show version information
 
 OPTIONS:
     -x, --execute <cmd>          Execute command after switching (instead of shell)
+    --merge <branch>             Merge worktree's branch into default branch and delete
+    --squash                     Use squash merge (with --merge)
+    --ff-only                    Use fast-forward only merge (with --merge, default)
 
 EXAMPLES:
     gt                           # Open TUI to manage worktrees
@@ -1363,6 +1609,8 @@ EXAMPLES:
     gt fix-bug main              # Create worktree 'fix-bug' from 'main' branch
     gt feature-xyz -x "code ."   # Create worktree and open in VS Code
     gt feature-xyz -x claude     # Create worktree and start Claude Code
+    gt --merge feature-xyz       # Merge 'feature-xyz' into main (ff-only)
+    gt --merge feature-xyz --squash  # Squash merge into main
 
 SHELL COMPLETION:
     # Bash: Add to ~/.bashrc
@@ -1377,6 +1625,7 @@ SHELL COMPLETION:
 INTERACTIVE MODE COMMANDS:
     n        Create new worktree
     d        Delete selected worktree
+    m        Merge worktree into default branch and delete
     a        Open actions menu for selected worktree
     enter    Switch to selected worktree
     /        Search worktrees
@@ -1402,6 +1651,7 @@ CONFIGURATION:
                     Use "../" prefix to place worktrees as siblings
     - shell: Shell to use when switching (default: $SHELL or /bin/bash)
     - post_create: Command to run after creating a worktree (e.g., "npm install")
+    - default_merge_strategy: Default merge strategy - "squash" or "ff-only" (default)
 
     Example configs:
 
@@ -1506,7 +1756,7 @@ func switchToWorktree(worktreePath string, config *Config, executeCmd string) er
 	return cmd.Run()
 }
 
-func parseArgs() (worktreeName, sourceBranch, executeCmd, completionShell string, showHelp, showVersion bool) {
+func parseArgs() (worktreeName, sourceBranch, executeCmd, completionShell string, showHelp, showVersion, mergeMode bool, mergeStrategy string) {
 	args := os.Args[1:]
 	var positional []string
 
@@ -1536,6 +1786,12 @@ func parseArgs() (worktreeName, sourceBranch, executeCmd, completionShell string
 			executeCmd = strings.TrimPrefix(arg, "-x=")
 		case strings.HasPrefix(arg, "--execute="):
 			executeCmd = strings.TrimPrefix(arg, "--execute=")
+		case arg == "--merge":
+			mergeMode = true
+		case arg == "--squash":
+			mergeStrategy = "squash"
+		case arg == "--ff-only":
+			mergeStrategy = "ff-only"
 		case !strings.HasPrefix(arg, "-"):
 			positional = append(positional, arg)
 		}
@@ -1548,11 +1804,16 @@ func parseArgs() (worktreeName, sourceBranch, executeCmd, completionShell string
 		sourceBranch = positional[1]
 	}
 
+	// Default merge strategy if not specified
+	if mergeMode && mergeStrategy == "" {
+		mergeStrategy = "ff-only"
+	}
+
 	return
 }
 
 func main() {
-	worktreeName, sourceBranch, executeCmd, completionShell, showHelp, showVersion := parseArgs()
+	worktreeName, sourceBranch, executeCmd, completionShell, showHelp, showVersion, mergeMode, mergeStrategy := parseArgs()
 
 	if showHelp {
 		printHelp()
@@ -1566,6 +1827,73 @@ func main() {
 
 	if completionShell != "" {
 		printCompletion(completionShell)
+		os.Exit(0)
+	}
+
+	// Handle merge mode
+	if mergeMode {
+		if worktreeName == "" {
+			fmt.Fprintf(os.Stderr, "Error: --merge requires a worktree/branch name\n")
+			os.Exit(1)
+		}
+
+		repoPath, err := getCurrentRepoPath()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		config, _ := loadConfig()
+		if config == nil {
+			config = &Config{}
+		}
+
+		// Get worktrees and find the target
+		worktrees, err := getWorktrees(repoPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		var target *Worktree
+		for i := range worktrees {
+			if worktrees[i].Branch == worktreeName {
+				target = &worktrees[i]
+				break
+			}
+		}
+
+		if target == nil {
+			fmt.Fprintf(os.Stderr, "Error: worktree with branch '%s' not found\n", worktreeName)
+			os.Exit(1)
+		}
+
+		// Get default branch
+		defaultBranch := getDefaultBranch(repoPath)
+
+		// Validate
+		if target.IsCurrent {
+			fmt.Fprintf(os.Stderr, "Error: cannot merge currently checked out worktree\n")
+			os.Exit(1)
+		}
+
+		// Use config default if strategy not specified
+		if mergeStrategy == "" && config.DefaultMergeStrategy != "" {
+			mergeStrategy = config.DefaultMergeStrategy
+		}
+		if mergeStrategy == "" {
+			mergeStrategy = "ff-only"
+		}
+
+		// Show what we're about to do
+		fmt.Printf("Merging '%s' into '%s' using %s...\n", target.Branch, defaultBranch, mergeStrategy)
+
+		if err := mergeAndDeleteWorktree(repoPath, target, defaultBranch, mergeStrategy); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Successfully merged '%s' into '%s' and deleted worktree\n", target.Branch, defaultBranch)
 		os.Exit(0)
 	}
 
@@ -1633,7 +1961,7 @@ func main() {
 		}
 		os.Exit(0)
 	}
-	
+
 	// No arguments - run interactive mode
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
