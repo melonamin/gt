@@ -1016,16 +1016,39 @@ func getShell(config *Config) string {
 	return "/bin/bash"
 }
 
-func ensureGitignoreEntry(repoPath, entry string) error {
-	gitignorePath := filepath.Join(repoPath, ".gitignore")
+func gitExcludePath(repoPath string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	cmd.Dir = repoPath
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve git dir: %w", err)
+	}
+
+	gitDir := strings.TrimSpace(string(output))
+	if gitDir == "" {
+		return "", fmt.Errorf("git dir not found")
+	}
+
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(repoPath, gitDir)
+	}
+
+	return filepath.Join(gitDir, "info", "exclude"), nil
+}
+
+func ensureGitExcludeEntry(repoPath, entry string) error {
+	excludePath, err := gitExcludePath(repoPath)
+	if err != nil {
+		return err
+	}
 
 	// Ensure entry ends with / if it's a directory
 	if !strings.HasSuffix(entry, "/") {
 		entry = entry + "/"
 	}
 
-	// Read existing .gitignore content
-	content, err := os.ReadFile(gitignorePath)
+	// Read existing exclude file content
+	content, err := os.ReadFile(excludePath)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -1040,7 +1063,7 @@ func ensureGitignoreEntry(repoPath, entry string) error {
 		}
 	}
 
-	// Add entry to .gitignore
+	// Add entry to git excludes
 	newContent := string(content)
 	if len(content) > 0 && !strings.HasSuffix(newContent, "\n") {
 		newContent += "\n"
@@ -1063,7 +1086,26 @@ func ensureGitignoreEntry(repoPath, entry string) error {
 
 	newContent += entry + "\n"
 
-	return os.WriteFile(gitignorePath, []byte(newContent), 0644)
+	return os.WriteFile(excludePath, []byte(newContent), 0644)
+}
+
+func ensureNoTrackedFiles(repoPath, relPath string) error {
+	relPath = strings.TrimSuffix(filepath.ToSlash(relPath), "/")
+	if relPath == "" {
+		return nil
+	}
+
+	cmd := exec.Command("git", "ls-files", "-z", "--", relPath)
+	cmd.Dir = repoPath
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to check tracked files under %s: %w", relPath, err)
+	}
+	if len(output) > 0 {
+		return fmt.Errorf("worktree directory %q contains tracked files; use a different worktree_dir", relPath)
+	}
+
+	return nil
 }
 
 func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, config *Config) error {
@@ -1083,14 +1125,17 @@ func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, confi
 		return err
 	}
 
-	// Add worktree directory to .gitignore if it's within the repo
+	// Add worktree directory to git excludes if it's within the repo
 	if strings.HasPrefix(worktreeDir, repoPath) {
 		relPath, _ := filepath.Rel(repoPath, worktreeDir)
 		if relPath != "" && !strings.HasPrefix(relPath, "..") {
-			if err := ensureGitignoreEntry(repoPath, relPath); err != nil {
-				// Don't fail the worktree creation if we can't update .gitignore
+			if err := ensureNoTrackedFiles(repoPath, relPath); err != nil {
+				return err
+			}
+			if err := ensureGitExcludeEntry(repoPath, relPath); err != nil {
+				// Don't fail the worktree creation if we can't update git excludes
 				// Just continue with a warning
-				fmt.Fprintf(os.Stderr, "Warning: Could not update .gitignore: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Warning: Could not update git excludes: %v\n", err)
 			}
 		}
 	}
@@ -1132,14 +1177,17 @@ func createWorktree(repoPath, branch string, config *Config) error {
 		return err
 	}
 
-	// Add worktree directory to .gitignore if it's within the repo
+	// Add worktree directory to git excludes if it's within the repo
 	if strings.HasPrefix(worktreeDir, repoPath) {
 		relPath, _ := filepath.Rel(repoPath, worktreeDir)
 		if relPath != "" && !strings.HasPrefix(relPath, "..") {
-			if err := ensureGitignoreEntry(repoPath, relPath); err != nil {
-				// Don't fail the worktree creation if we can't update .gitignore
+			if err := ensureNoTrackedFiles(repoPath, relPath); err != nil {
+				return err
+			}
+			if err := ensureGitExcludeEntry(repoPath, relPath); err != nil {
+				// Don't fail the worktree creation if we can't update git excludes
 				// Just continue with a warning
-				fmt.Fprintf(os.Stderr, "Warning: Could not update .gitignore: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Warning: Could not update git excludes: %v\n", err)
 			}
 		}
 	}

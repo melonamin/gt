@@ -15,7 +15,7 @@ Ever find yourself juggling multiple feature branches, hotfixes, and experiments
 Instantly manage all your Git worktrees with:
 - **Interactive TUI** - See all worktrees at a glance
 - **Instant creation** - `gt feature-x` creates and switches in one command
-- **Smart organization** - Keeps worktrees in `.worktrees/` (auto-added to `.gitignore`)
+- **Smart organization** - Keeps worktrees in `.worktrees/` (auto-added to `.git/info/exclude`)
 - **Zero config** - Single binary, works out of the box
 
 ## Installation
@@ -124,7 +124,7 @@ Worktrees are stored in `.worktrees/` within your repo:
 ```
 my-project/
 ├── .git/
-├── .worktrees/       # All worktrees here (auto-added to .gitignore)
+├── .worktrees/       # All worktrees here (auto-added to .git/info/exclude)
 │   ├── feature-auth/
 │   ├── fix-bug/
 │   └── experiment/
@@ -205,7 +205,7 @@ Git worktrees let you have multiple working directories for the same repository.
 1. Organizing them in one place
 2. Providing instant creation/switching
 3. Showing status at a glance
-4. Auto-managing `.gitignore`
+4. Auto-managing `.git/info/exclude`
 
 ## Comparison with Alternatives
 
@@ -224,7 +224,7 @@ Git worktrees let you have multiple working directories for the same repository.
 A: `gt` is to `git worktree` what `tig` is to `git log`. It makes the powerful feature actually pleasant to use.
 
 **Q: Where are my worktrees stored?**
-A: By default in `.worktrees/` within your repo. This is configurable and automatically added to `.gitignore`.
+A: By default in `.worktrees/` within your repo. This is configurable and automatically added to `.git/info/exclude`.
 
 **Q: Can I use my existing worktrees?**
 A: Yes! `gt` shows all worktrees, regardless of where they were created.
