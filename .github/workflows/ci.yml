@@ -25,6 +25,11 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Configure git
+        run: |
+          git config --global user.name "CI Test"
+          git config --global user.email "ci@test.local"
+
       - name: Run tests
         run: go test -v -race -coverprofile=coverage.out ./...
 
@@ -46,6 +51,11 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+
+      - name: Configure git
+        run: |
+          git config --global user.name "CI Test"
+          git config --global user.email "ci@test.local"
 
       - name: Run tests
         run: go test -v -race ./...

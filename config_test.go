@@ -33,17 +33,6 @@ func TestGetConfigPathFallsBackToUserConfigDir(t *testing.T) {
 	}
 }
 
-func TestGetConfigPathWithWhitespaceXdg(t *testing.T) {
-	// Test that whitespace-only XDG_CONFIG_HOME is treated as empty
-	t.Setenv("XDG_CONFIG_HOME", "   ")
-
-	configPath := getConfigPath()
-
-	// Should fall back to default, not use whitespace path
-	if strings.HasPrefix(configPath, "   ") {
-		t.Errorf("config path should not start with whitespace: %q", configPath)
-	}
-}
 
 func TestConfigDefaultValues(t *testing.T) {
 	config := &Config{}

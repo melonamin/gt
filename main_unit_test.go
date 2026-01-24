@@ -191,12 +191,12 @@ func TestFilterWorktrees(t *testing.T) {
 
 func TestGetShell(t *testing.T) {
 	tests := []struct {
-		name       string
-		config     *Config
-		envShell   string
-		want       string
-		setEnv     bool
-		clearEnv   bool
+		name     string
+		config   *Config
+		envShell string
+		want     string
+		setEnv   bool
+		clearEnv bool
 	}{
 		{"config shell preferred", &Config{Shell: "/bin/zsh"}, "/bin/bash", "/bin/zsh", true, false},
 		{"env fallback when no config shell", &Config{}, "/bin/fish", "/bin/fish", true, false},
@@ -223,16 +223,16 @@ func TestGetShell(t *testing.T) {
 
 func TestParseArgs(t *testing.T) {
 	tests := []struct {
-		name             string
-		args             []string
-		wantWorktree     string
-		wantSource       string
-		wantExecute      string
-		wantCompletion   string
-		wantHelp         bool
-		wantVersion      bool
-		wantMerge        bool
-		wantMergeStrat   string
+		name           string
+		args           []string
+		wantWorktree   string
+		wantSource     string
+		wantExecute    string
+		wantCompletion string
+		wantHelp       bool
+		wantVersion    bool
+		wantMerge      bool
+		wantMergeStrat string
 	}{
 		{"no args", []string{"gt"}, "", "", "", "", false, false, false, ""},
 		{"help short", []string{"gt", "-h"}, "", "", "", "", true, false, false, ""},
