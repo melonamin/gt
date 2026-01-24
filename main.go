@@ -243,6 +243,10 @@ func truncateString(s string, maxLen int) string {
 }
 
 func getConfigPath() string {
+	if xdgConfigHome := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdgConfigHome != "" {
+		return filepath.Join(xdgConfigHome, configDirName, configFileName)
+	}
+
 	configHome, err := os.UserConfigDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()
