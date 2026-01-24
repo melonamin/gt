@@ -33,7 +33,6 @@ func TestGetConfigPathFallsBackToUserConfigDir(t *testing.T) {
 	}
 }
 
-
 func TestConfigDefaultValues(t *testing.T) {
 	config := &Config{}
 
