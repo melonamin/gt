@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,15 @@ const (
 	hashDisplayLength    = 7
 	branchDisplayWidth   = 20
 	ellipsis             = "..."
+
+	// Git command timeouts
+	gitCmdTimeout     = 5 * time.Second
+	gitCmdSlowTimeout = 10 * time.Second
+
+	// Internal throttling/timeouts
+	maxDetailFetchWorkers = 4
+	worktreeDetailTimeout = 30 * time.Second
+	worktreeCmdTimeout    = 2 * time.Minute
 )
 
 // Config holds user configuration loaded from ~/.config/gt/config.json.
@@ -40,6 +50,24 @@ type Config struct {
 	Shell                string `json:"shell,omitempty"`
 	PostCreate           string `json:"post_create,omitempty"`
 	DefaultMergeStrategy string `json:"default_merge_strategy,omitempty"` // "squash" or "ff-only"
+	GitTimeout           int    `json:"git_timeout,omitempty"`            // Git command timeout in seconds (default: 5)
+	GitSlowTimeout       int    `json:"git_slow_timeout,omitempty"`       // Slow git command timeout in seconds (default: 10)
+}
+
+// getGitTimeout returns the configured git command timeout or the default.
+func (c *Config) getGitTimeout() time.Duration {
+	if c != nil && c.GitTimeout > 0 {
+		return time.Duration(c.GitTimeout) * time.Second
+	}
+	return gitCmdTimeout
+}
+
+// getGitSlowTimeout returns the configured slow git command timeout or the default.
+func (c *Config) getGitSlowTimeout() time.Duration {
+	if c != nil && c.GitSlowTimeout > 0 {
+		return time.Duration(c.GitSlowTimeout) * time.Second
+	}
+	return gitCmdSlowTimeout
 }
 
 // Worktree represents a git worktree with its associated metadata.
@@ -99,11 +127,16 @@ type uiState struct {
 
 // worktreeState holds worktree-related data.
 type worktreeState struct {
-	worktrees        []Worktree
-	filtered         []Worktree
-	searchTerm       string
-	defaultBranch    string
-	previousWorktree string
+	worktrees           []Worktree
+	filtered            []Worktree
+	searchTerm          string
+	defaultBranch       string
+	previousWorktree    string
+	loading             bool
+	loadingMsg          string
+	detailQueue         []int
+	activeDetailFetches int
+	detailGeneration    int
 }
 
 // actionsState holds the state for the actions menu.
@@ -136,6 +169,7 @@ type model struct {
 	err      error
 	status   struct {
 		message string
+		isError bool
 		timeout time.Time
 	}
 	quitting bool
@@ -298,17 +332,53 @@ func getCurrentRepoPath() (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-// getAheadBehind returns the number of commits the branch is ahead/behind the default branch.
+// runGitCmd executes a git command with context support for cancellation.
+func runGitCmd(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	output, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("git command timed out: git %s", strings.Join(args, " "))
+	}
+	return output, err
+}
+
+// runGitCmdWithTimeout executes a git command with a timeout.
+func runGitCmdWithTimeout(dir string, timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return runGitCmd(ctx, dir, args...)
+}
+
+func runGitCmdCombined(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return output, fmt.Errorf("git command timed out: git %s", strings.Join(args, " "))
+	}
+	return output, err
+}
+
+func runGitCmdCombinedWithTimeout(dir string, timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return runGitCmdCombined(ctx, dir, args...)
+}
+
+// getAheadBehindWithContext returns the number of commits the branch is ahead/behind the default branch.
 // Returns (0, 0) if the branch is the default branch, or if any error occurs during git operations.
-func getAheadBehind(worktreePath, branch, defaultBranch string) (ahead, behind int) {
+func getAheadBehindWithContext(ctx context.Context, worktreePath, branch, defaultBranch string) (ahead, behind int) {
 	if branch == "" || branch == defaultBranch {
 		return 0, 0
 	}
 
 	// Get count of commits ahead and behind
-	cmd := exec.Command("git", "rev-list", "--left-right", "--count", fmt.Sprintf("%s...%s", defaultBranch, branch))
-	cmd.Dir = worktreePath
-	output, err := cmd.Output()
+	output, err := runGitCmd(ctx, worktreePath, "rev-list", "--left-right", "--count", fmt.Sprintf("%s...%s", defaultBranch, branch))
 	if err != nil {
 		// Git command failed (e.g., branch doesn't exist in remote, or not a valid ref)
 		// Silently return 0,0 as this is a non-critical display feature
@@ -333,16 +403,67 @@ func getAheadBehind(worktreePath, branch, defaultBranch string) (ahead, behind i
 	return aheadVal, behindVal
 }
 
-func getWorktrees(repoPath string) ([]Worktree, error) {
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
-	cmd.Dir = repoPath
-	output, err := cmd.Output()
+// getAheadBehind returns the number of commits the branch is ahead/behind the default branch.
+// Returns (0, 0) if the branch is the default branch, or if any error occurs during git operations.
+func getAheadBehind(worktreePath, branch, defaultBranch string) (ahead, behind int) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+	return getAheadBehindWithContext(ctx, worktreePath, branch, defaultBranch)
+}
+
+// worktreeDetails holds the fetched details for a single worktree.
+type worktreeDetails struct {
+	index      int
+	isDirty    bool
+	lastCommit CommitInfo
+	ahead      int
+	behind     int
+}
+
+// collectWorktreeDetail fetches status, commit info, and ahead/behind for a single worktree.
+// ctx must not be nil.
+func collectWorktreeDetail(ctx context.Context, wt Worktree, index int, defaultBranch string) worktreeDetails {
+	result := worktreeDetails{index: index}
+
+	// Check if dirty
+	output, err := runGitCmd(ctx, wt.Path, "status", "--porcelain")
+	if err == nil {
+		result.isDirty = len(strings.TrimSpace(string(output))) > 0
+	}
+
+	// Get last commit info
+	output, err = runGitCmd(ctx, wt.Path, "log", "-1", "--pretty=format:%H|%s|%ai|%an")
+	if err == nil && len(output) > 0 {
+		parts := strings.Split(string(output), "|")
+		if len(parts) >= 4 {
+			hash := parts[0]
+			if len(hash) > hashDisplayLength {
+				hash = hash[:hashDisplayLength]
+			}
+			result.lastCommit.Hash = hash
+			result.lastCommit.Message = parts[1]
+			if t, err := time.Parse("2006-01-02 15:04:05 -0700", parts[2]); err == nil {
+				result.lastCommit.Date = t
+			}
+			result.lastCommit.Author = parts[3]
+		}
+	}
+
+	// Get ahead/behind count relative to default branch
+	result.ahead, result.behind = getAheadBehindWithContext(ctx, wt.Path, wt.Branch, defaultBranch)
+
+	return result
+}
+
+// listWorktreesWithContext fetches basic worktree metadata without per-worktree git status calls.
+func listWorktreesWithContext(ctx context.Context, repoPath string) ([]Worktree, string, error) {
+	output, err := runGitCmd(ctx, repoPath, "worktree", "list", "--porcelain")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Get default branch early for ahead/behind calculation
-	defaultBranch := getDefaultBranch(repoPath)
+	defaultBranch := getDefaultBranchWithContext(ctx, repoPath)
 
 	var worktrees []Worktree
 	lines := strings.Split(string(output), "\n")
@@ -372,44 +493,55 @@ func getWorktrees(repoPath string) ([]Worktree, error) {
 
 	// Get current directory to mark current worktree
 	cwd, _ := os.Getwd()
-
-	// Get additional info for each worktree
 	for i := range worktrees {
 		worktrees[i].IsCurrent = strings.HasPrefix(cwd, worktrees[i].Path)
-
-		// Check if dirty
-		cmd := exec.Command("git", "status", "--porcelain")
-		cmd.Dir = worktrees[i].Path
-		output, err := cmd.Output()
-		if err == nil {
-			worktrees[i].IsDirty = len(strings.TrimSpace(string(output))) > 0
-		}
-
-		// Get last commit info
-		cmd = exec.Command("git", "log", "-1", "--pretty=format:%H|%s|%ai|%an")
-		cmd.Dir = worktrees[i].Path
-		output, err = cmd.Output()
-		if err == nil && len(output) > 0 {
-			parts := strings.Split(string(output), "|")
-			if len(parts) >= 4 {
-				hash := parts[0]
-				if len(hash) > hashDisplayLength {
-					hash = hash[:hashDisplayLength]
-				}
-				worktrees[i].LastCommit.Hash = hash
-				worktrees[i].LastCommit.Message = parts[1]
-				if t, err := time.Parse("2006-01-02 15:04:05 -0700", parts[2]); err == nil {
-					worktrees[i].LastCommit.Date = t
-				}
-				worktrees[i].LastCommit.Author = parts[3]
-			}
-		}
-
-		// Get ahead/behind count relative to default branch
-		worktrees[i].Ahead, worktrees[i].Behind = getAheadBehind(worktrees[i].Path, worktrees[i].Branch, defaultBranch)
 	}
 
-	return worktrees, nil
+	return worktrees, defaultBranch, nil
+}
+
+// populateWorktreeDetails fills in expensive metadata for each worktree sequentially.
+func populateWorktreeDetails(ctx context.Context, worktrees []Worktree, defaultBranch string) []Worktree {
+	if len(worktrees) == 0 {
+		return worktrees
+	}
+
+	parentCtx := ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+
+	for i := range worktrees {
+		detailCtx, cancel := context.WithTimeout(parentCtx, worktreeDetailTimeout)
+		detail := collectWorktreeDetail(detailCtx, worktrees[i], i, defaultBranch)
+		cancel()
+		worktrees[i].IsDirty = detail.isDirty
+		worktrees[i].LastCommit = detail.lastCommit
+		worktrees[i].Ahead = detail.ahead
+		worktrees[i].Behind = detail.behind
+	}
+
+	return worktrees
+}
+
+// getWorktreesWithContext fetches all worktrees along with their details.
+func getWorktreesWithContext(ctx context.Context, repoPath string) ([]Worktree, string, error) {
+	worktrees, defaultBranch, err := listWorktreesWithContext(ctx, repoPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return worktrees, defaultBranch, ctx.Err()
+	}
+	worktrees = populateWorktreeDetails(ctx, worktrees, defaultBranch)
+	return worktrees, defaultBranch, nil
+}
+
+func getWorktrees(repoPath string) ([]Worktree, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
+	defer cancel()
+	worktrees, _, err := getWorktreesWithContext(ctx, repoPath)
+	return worktrees, err
 }
 
 func filterWorktrees(worktrees []Worktree, search string) []Worktree {
@@ -556,30 +688,12 @@ func initialModel() model {
 		config = &Config{}
 	}
 
-	worktrees, err := getWorktrees(repoPath)
-	if err != nil {
-		return model{err: err}
-	}
-
-	// Get default branch for ^ shortcut
-	defaultBranch := getDefaultBranch(repoPath)
-
-	// Find current worktree path for tracking previous (session-only)
-	var currentPath string
-	for _, wt := range worktrees {
-		if wt.IsCurrent {
-			currentPath = wt.Path
-			break
-		}
-	}
-
+	// Return immediately with loading state - actual data fetch happens in Init()
 	return model{
 		ui: uiState{},
 		wt: worktreeState{
-			worktrees:        worktrees,
-			filtered:         worktrees,
-			defaultBranch:    defaultBranch,
-			previousWorktree: currentPath,
+			loading:    true,
+			loadingMsg: "Loading worktrees...",
 		},
 		acts: actionsState{
 			actions: getActions(),
@@ -590,7 +704,11 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	if m.err != nil {
+		return nil
+	}
+	// Start async worktree loading
+	return loadWorktreesCmd(m.repoPath)
 }
 
 type tickMsg time.Time
@@ -601,21 +719,133 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+// worktreesLoadedMsg is sent when async worktree loading completes.
+type worktreesLoadedMsg struct {
+	worktrees     []Worktree
+	defaultBranch string
+	err           error
+}
+
+// worktreeDetailLoadedMsg reports incremental detail updates for a single worktree.
+type worktreeDetailLoadedMsg struct {
+	detail     worktreeDetails
+	generation int
+}
+
+func fetchWorktreeDetailCmd(wt Worktree, index int, defaultBranch string, generation int) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), worktreeDetailTimeout)
+		defer cancel()
+		detail := collectWorktreeDetail(ctx, wt, index, defaultBranch)
+		return worktreeDetailLoadedMsg{
+			detail:     detail,
+			generation: generation,
+		}
+	}
+}
+
+type worktreeCreatedMsg struct {
+	branch string
+	err    error
+}
+
+func createWorktreeCmd(repoPath, branch string, config *Config) tea.Cmd {
+	var cfg *Config
+	if config != nil {
+		copy := *config
+		cfg = &copy
+	}
+	return func() tea.Msg {
+		err := createWorktree(repoPath, branch, cfg)
+		return worktreeCreatedMsg{
+			branch: branch,
+			err:    err,
+		}
+	}
+}
+
+// loadWorktreesCmd creates a command that loads worktrees asynchronously.
+func loadWorktreesCmd(repoPath string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
+		defer cancel()
+		worktrees, defaultBranch, err := listWorktreesWithContext(ctx, repoPath)
+		return worktreesLoadedMsg{
+			worktrees:     worktrees,
+			defaultBranch: defaultBranch,
+			err:           err,
+		}
+	}
+}
+
 // setStatus sets a status message that will be displayed temporarily.
 func (m *model) setStatus(msg string, timeout time.Duration) {
 	m.status.message = msg
+	m.status.isError = false
 	m.status.timeout = time.Now().Add(timeout)
 }
 
-// refreshWorktrees reloads the worktree list from git.
-func (m *model) refreshWorktrees() {
-	worktrees, err := getWorktrees(m.repoPath)
-	if err != nil {
-		m.setStatus(fmt.Sprintf("Refresh failed: %v", err), statusMessageTimeout)
+// setErrorStatus sets an error status message that will be displayed temporarily.
+func (m *model) setErrorStatus(msg string, timeout time.Duration) {
+	m.status.message = msg
+	m.status.isError = true
+	m.status.timeout = time.Now().Add(timeout)
+}
+
+// refreshWorktrees sets loading state and returns a command to reload the worktree list.
+func (m *model) refreshWorktrees() tea.Cmd {
+	m.wt.loading = true
+	m.wt.loadingMsg = "Refreshing..."
+	m.wt.detailQueue = nil
+	m.wt.activeDetailFetches = 0
+	return loadWorktreesCmd(m.repoPath)
+}
+
+func (m *model) resetDetailQueue() {
+	m.wt.detailQueue = m.wt.detailQueue[:0]
+	for i := range m.wt.worktrees {
+		m.wt.detailQueue = append(m.wt.detailQueue, i)
+	}
+	m.wt.activeDetailFetches = 0
+}
+
+func (m *model) startDetailFetches() tea.Cmd {
+	if len(m.wt.detailQueue) == 0 {
+		return nil
+	}
+
+	maxWorkers := maxDetailFetchWorkers
+	cmds := make([]tea.Cmd, 0, maxWorkers)
+	for m.wt.activeDetailFetches < maxWorkers && len(m.wt.detailQueue) > 0 {
+		idx := m.wt.detailQueue[0]
+		m.wt.detailQueue = m.wt.detailQueue[1:]
+		if idx < 0 || idx >= len(m.wt.worktrees) {
+			continue
+		}
+		wt := m.wt.worktrees[idx]
+		cmds = append(cmds, fetchWorktreeDetailCmd(wt, idx, m.wt.defaultBranch, m.wt.detailGeneration))
+		m.wt.activeDetailFetches++
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m *model) applyWorktreeDetail(detail worktreeDetails) {
+	if detail.index < 0 || detail.index >= len(m.wt.worktrees) {
 		return
 	}
-	m.wt.worktrees = worktrees
-	m.wt.filtered = filterWorktrees(worktrees, m.wt.searchTerm)
+
+	wt := &m.wt.worktrees[detail.index]
+	wt.IsDirty = detail.isDirty
+	wt.LastCommit = detail.lastCommit
+	wt.Ahead = detail.ahead
+	wt.Behind = detail.behind
+
+	// Rebuild filtered from worktrees to keep them in sync
+	// This is O(n) but simpler and more correct than manual sync
+	m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
 }
 
 // clampScroll adjusts scroll offset to keep the cursor visible within the viewport.
@@ -636,17 +866,18 @@ func (m *model) clampScroll() {
 func (m model) handleDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
+		var refreshCmd tea.Cmd
 		if m.del.target != nil {
 			if err := deleteWorktree(m.repoPath, m.del.target.Path); err != nil {
-				m.err = err
+				m.setErrorStatus(fmt.Sprintf("Delete failed: %v", err), statusMessageTimeout)
 			} else {
 				m.setStatus(fmt.Sprintf("Deleted worktree: %s", m.del.target.Branch), statusMessageTimeout)
-				m.refreshWorktrees()
+				refreshCmd = m.refreshWorktrees()
 			}
 		}
 		m.del.confirming = false
 		m.del.target = nil
-		return m, tickCmd()
+		return m, tea.Batch(tickCmd(), refreshCmd)
 	case "n", "N", "esc", "ctrl+c":
 		m.del.confirming = false
 		m.del.target = nil
@@ -689,18 +920,21 @@ func (m model) handleNewBranchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ui.inputValue = ""
 		return m, nil
 	case "enter":
+		var createCmd tea.Cmd
 		if m.ui.inputValue != "" {
 			if err := validateBranchName(m.ui.inputValue); err != nil {
-				m.err = err
-			} else if err := createWorktree(m.repoPath, m.ui.inputValue, m.config); err != nil {
-				m.err = err
+				m.setErrorStatus(fmt.Sprintf("Invalid branch name: %v", err), statusMessageTimeout)
 			} else {
-				m.setStatus(fmt.Sprintf("Created worktree: %s", m.ui.inputValue), statusMessageTimeout)
-				m.refreshWorktrees()
+				m.wt.loading = true
+				m.wt.loadingMsg = fmt.Sprintf("Creating %s...", m.ui.inputValue)
+				createCmd = createWorktreeCmd(m.repoPath, m.ui.inputValue, m.config)
 			}
 		}
 		m.ui.inputMode = modeNormal
 		m.ui.inputValue = ""
+		if createCmd != nil {
+			return m, tea.Batch(tickCmd(), createCmd)
+		}
 		return m, tickCmd()
 	case "backspace":
 		if len(m.ui.inputValue) > 0 {
@@ -730,7 +964,7 @@ func (m model) runAction(action action, wt *Worktree) (tea.Model, tea.Cmd) {
 
 	// Non-exiting action: run and show status
 	if err := action.fn(wt, m.config); err != nil {
-		m.setStatus(fmt.Sprintf("Action failed: %v", err), statusMessageTimeout)
+		m.setErrorStatus(fmt.Sprintf("Action failed: %v", err), statusMessageTimeout)
 	} else {
 		m.setStatus(fmt.Sprintf("%s completed", action.label), refreshTimeout)
 	}
@@ -798,18 +1032,19 @@ func (m model) handleMergeStrategyMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) handleMergeConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
+		var refreshCmd tea.Cmd
 		if m.merge.target != nil {
 			if err := mergeAndDeleteWorktree(m.repoPath, m.merge.target, m.wt.defaultBranch, m.merge.strategy); err != nil {
-				m.err = err
+				m.setErrorStatus(fmt.Sprintf("Merge failed: %v", err), statusMessageTimeout)
 			} else {
 				m.setStatus(fmt.Sprintf("Merged '%s' into '%s' and deleted worktree", m.merge.target.Branch, m.wt.defaultBranch), statusMessageTimeout)
-				m.refreshWorktrees()
+				refreshCmd = m.refreshWorktrees()
 			}
 		}
 		m.ui.inputMode = modeNormal
 		m.merge.target = nil
 		m.merge.strategy = ""
-		return m, tickCmd()
+		return m, tea.Batch(tickCmd(), refreshCmd)
 	case "n", "N", "esc", "ctrl+c":
 		m.ui.inputMode = modeNormal
 		m.merge.target = nil
@@ -854,8 +1089,8 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.ui.cursor < len(m.wt.filtered) {
 			wt := &m.wt.filtered[m.ui.cursor]
 			if strings.HasSuffix(m.repoPath, wt.Path) {
-				m.err = fmt.Errorf("cannot delete main worktree")
-				return m, nil
+				m.setErrorStatus("Cannot delete main worktree", statusMessageTimeout)
+				return m, tickCmd()
 			}
 			m.del.confirming = true
 			m.del.target = wt
@@ -863,9 +1098,8 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "r":
-		m.refreshWorktrees()
-		m.setStatus("Refreshed", refreshTimeout)
-		return m, tickCmd()
+		refreshCmd := m.refreshWorktrees()
+		return m, tea.Batch(tickCmd(), refreshCmd)
 
 	case "^":
 		for i, wt := range m.wt.filtered {
@@ -914,16 +1148,16 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			wt := &m.wt.filtered[m.ui.cursor]
 			// Validate before showing strategy picker
 			if strings.HasSuffix(m.repoPath, wt.Path) {
-				m.err = fmt.Errorf("cannot merge main worktree")
-				return m, nil
+				m.setErrorStatus("Cannot merge main worktree", statusMessageTimeout)
+				return m, tickCmd()
 			}
 			if wt.Branch == m.wt.defaultBranch {
-				m.err = fmt.Errorf("cannot merge default branch into itself")
-				return m, nil
+				m.setErrorStatus("Cannot merge default branch into itself", statusMessageTimeout)
+				return m, tickCmd()
 			}
 			if wt.IsCurrent {
-				m.err = fmt.Errorf("cannot merge currently checked out worktree")
-				return m, nil
+				m.setErrorStatus("Cannot merge currently checked out worktree", statusMessageTimeout)
+				return m, tickCmd()
 			}
 			m.merge.target = wt
 			m.ui.inputMode = modeMergeStrategy
@@ -946,8 +1180,9 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			printInfo("Switching to %s...", wt.Path)
 
 			if err := os.Chdir(wt.Path); err != nil {
-				m.err = err
-				return m, nil
+				m.quitting = false
+				m.setErrorStatus(fmt.Sprintf("Failed to switch: %v", err), statusMessageTimeout)
+				return m, tickCmd()
 			}
 
 			shell := getShell(m.config)
@@ -976,6 +1211,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ui.height = msg.Height
 		return m, nil
 
+	case worktreesLoadedMsg:
+		m.wt.loading = false
+		m.wt.loadingMsg = ""
+		if msg.err != nil {
+			m.wt.detailQueue = nil
+			m.wt.activeDetailFetches = 0
+			m.setErrorStatus(fmt.Sprintf("Load failed: %v", msg.err), statusMessageTimeout)
+			return m, tickCmd()
+		}
+		m.wt.worktrees = msg.worktrees
+		m.wt.filtered = filterWorktrees(msg.worktrees, m.wt.searchTerm)
+		m.wt.defaultBranch = msg.defaultBranch
+		m.wt.detailGeneration++
+		m.resetDetailQueue()
+		// Find current worktree path for tracking previous (session-only)
+		if m.wt.previousWorktree == "" {
+			for _, wt := range msg.worktrees {
+				if wt.IsCurrent {
+					m.wt.previousWorktree = wt.Path
+					break
+				}
+			}
+		}
+		if detailCmd := m.startDetailFetches(); detailCmd != nil {
+			return m, tea.Batch(tickCmd(), detailCmd)
+		}
+		return m, tickCmd()
+
+	case worktreeDetailLoadedMsg:
+		if msg.generation != m.wt.detailGeneration {
+			return m, tickCmd()
+		}
+		if m.wt.activeDetailFetches > 0 {
+			m.wt.activeDetailFetches--
+		}
+		m.applyWorktreeDetail(msg.detail)
+		if detailCmd := m.startDetailFetches(); detailCmd != nil {
+			return m, tea.Batch(tickCmd(), detailCmd)
+		}
+		return m, tickCmd()
+
+	case worktreeCreatedMsg:
+		m.wt.loading = false
+		m.wt.loadingMsg = ""
+		if msg.err != nil {
+			m.setErrorStatus(fmt.Sprintf("Create failed: %v", msg.err), statusMessageTimeout)
+			return m, tickCmd()
+		}
+		m.setStatus(fmt.Sprintf("Created worktree: %s", msg.branch), statusMessageTimeout)
+		refreshCmd := m.refreshWorktrees()
+		return m, tea.Batch(tickCmd(), refreshCmd)
+
 	case tickMsg:
 		if !m.status.timeout.IsZero() && time.Now().After(m.status.timeout) {
 			m.status.message = ""
@@ -984,8 +1271,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickCmd()
 
 	case tea.KeyMsg:
-		// Clear any previous operational error on keypress
-		m.err = nil
+		// m.err is reserved for fatal errors; operational errors use setStatus
 
 		if m.del.confirming {
 			return m.handleDeleteConfirm(msg)
@@ -1112,6 +1398,29 @@ func ensureNoTrackedFiles(repoPath, relPath string) error {
 	return nil
 }
 
+func refExists(repoPath, ref string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+	_, err := runGitCmd(ctx, repoPath, "rev-parse", "--verify", ref)
+	return err == nil
+}
+
+func localBranchExists(repoPath, branch string) bool {
+	return refExists(repoPath, branch)
+}
+
+func remoteBranchExists(repoPath, branch string) bool {
+	// Fast path: check local tracking ref
+	if refExists(repoPath, fmt.Sprintf("refs/remotes/origin/%s", branch)) {
+		return true
+	}
+	// Slow path: query remote (for unfetched branches)
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
+	defer cancel()
+	output, err := runGitCmd(ctx, repoPath, "ls-remote", "--heads", "origin", branch)
+	return err == nil && len(strings.TrimSpace(string(output))) > 0
+}
+
 func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, config *Config) error {
 	// Determine worktree directory
 	worktreeDir := defaultWorktreeDir
@@ -1148,16 +1457,14 @@ func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, confi
 	worktreePath := filepath.Join(worktreeDir, strings.ReplaceAll(worktreeName, "/", "-"))
 
 	// Create worktree with new branch from source branch
-	cmd := exec.Command("git", "worktree", "add", "-b", worktreeName, worktreePath, sourceBranch)
-	cmd.Dir = repoPath
-	output, err := cmd.CombinedOutput()
+	args := []string{"worktree", "add", "-b", worktreeName, worktreePath, sourceBranch}
+	output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 	if err != nil {
 		// If branch already exists, try without -b flag
-		cmd = exec.Command("git", "worktree", "add", worktreePath, worktreeName)
-		cmd.Dir = repoPath
-		output, err = cmd.CombinedOutput()
+		args = []string{"worktree", "add", worktreePath, worktreeName}
+		output, err = runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 		if err != nil {
-			return fmt.Errorf("failed to create worktree: %s", string(output))
+			return fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
 		}
 	}
 
@@ -1199,30 +1506,26 @@ func createWorktree(repoPath, branch string, config *Config) error {
 	// Generate worktree path
 	worktreePath := filepath.Join(worktreeDir, strings.ReplaceAll(branch, "/", "-"))
 
-	// Check if branch exists locally or remotely
-	cmd := exec.Command("git", "rev-parse", "--verify", branch)
-	cmd.Dir = repoPath
-	if err := cmd.Run(); err != nil {
-		// Try as remote branch
-		cmd = exec.Command("git", "ls-remote", "--heads", "origin", branch)
-		cmd.Dir = repoPath
-		output, err := cmd.Output()
-		if err != nil || len(output) == 0 {
-			// Create new branch
-			cmd = exec.Command("git", "worktree", "add", "-b", branch, worktreePath)
-		} else {
-			// Checkout existing remote branch
-			cmd = exec.Command("git", "worktree", "add", worktreePath, branch)
-		}
-	} else {
-		// Checkout existing local branch
-		cmd = exec.Command("git", "worktree", "add", worktreePath, branch)
+	// Determine best strategy based on existing refs
+	var (
+		args         []string
+		remoteRef    = fmt.Sprintf("origin/%s", branch)
+		localExists  = localBranchExists(repoPath, branch)
+		remoteExists = remoteBranchExists(repoPath, branch)
+	)
+
+	switch {
+	case localExists:
+		args = []string{"worktree", "add", worktreePath, branch}
+	case remoteExists:
+		args = []string{"worktree", "add", "--track", "-b", branch, worktreePath, remoteRef}
+	default:
+		args = []string{"worktree", "add", "-b", branch, worktreePath}
 	}
 
-	cmd.Dir = repoPath
-	output, err := cmd.CombinedOutput()
+	output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 	if err != nil {
-		return fmt.Errorf("failed to create worktree: %s", string(output))
+		return fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
 	}
 
 	return nil
@@ -1393,6 +1696,12 @@ func (m model) View() string {
 	title := fmt.Sprintf("Git Worktrees - %s", m.repoPath)
 	s.WriteString(titleStyle.Render(title) + "\n")
 
+	// Loading indicator
+	if m.wt.loading {
+		s.WriteString("\n" + dimStyle.Render(m.wt.loadingMsg) + "\n")
+		return s.String()
+	}
+
 	// Search or input
 	switch m.ui.inputMode {
 	case modeSearch:
@@ -1527,7 +1836,11 @@ func (m model) View() string {
 
 	// Status message
 	if m.status.message != "" {
-		s.WriteString("\n" + successStyle.Render(m.status.message) + "\n")
+		style := successStyle
+		if m.status.isError {
+			style = errorStyle
+		}
+		s.WriteString("\n" + style.Render(m.status.message) + "\n")
 	}
 
 	// Help
@@ -1735,11 +2048,9 @@ func getCurrentBranch(repoPath string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func getDefaultBranch(repoPath string) string {
+func getDefaultBranchWithContext(ctx context.Context, repoPath string) string {
 	// Try to get the default branch from remote
-	cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
-	cmd.Dir = repoPath
-	output, err := cmd.Output()
+	output, err := runGitCmd(ctx, repoPath, "symbolic-ref", "refs/remotes/origin/HEAD")
 	if err == nil {
 		ref := strings.TrimSpace(string(output))
 		// refs/remotes/origin/main -> main
@@ -1751,14 +2062,19 @@ func getDefaultBranch(repoPath string) string {
 
 	// Fallback: check common default branch names
 	for _, branch := range []string{"main", "master"} {
-		cmd = exec.Command("git", "rev-parse", "--verify", branch)
-		cmd.Dir = repoPath
-		if err := cmd.Run(); err == nil {
+		_, err := runGitCmd(ctx, repoPath, "rev-parse", "--verify", branch)
+		if err == nil {
 			return branch
 		}
 	}
 
 	return "main"
+}
+
+func getDefaultBranch(repoPath string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+	return getDefaultBranchWithContext(ctx, repoPath)
 }
 
 func runPostCreateHook(worktreePath string, config *Config) error {
