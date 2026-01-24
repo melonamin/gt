@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -39,22 +38,6 @@ func initRepo(t *testing.T) string {
 	return repoPath
 }
 
-// initRepoWithBranches creates a repo with an initial commit and additional branches.
-// Each branch is created from the initial commit with its own unique commit.
-func initRepoWithBranches(t *testing.T, branches ...string) string {
-	t.Helper()
-
-	repoPath := initRepo(t)
-
-	for _, branch := range branches {
-		runGit(t, repoPath, "checkout", "-b", branch)
-		addCommits(t, repoPath, 1)
-		runGit(t, repoPath, "checkout", "-")
-	}
-
-	return repoPath
-}
-
 // addCommits adds n commits to the current branch in the repo.
 func addCommits(t *testing.T, repoPath string, n int) {
 	t.Helper()
@@ -78,33 +61,5 @@ func createDirtyState(t *testing.T, repoPath string) {
 	dirtyFile := filepath.Join(repoPath, "dirty.txt")
 	if err := os.WriteFile(dirtyFile, []byte("uncommitted changes"), 0644); err != nil {
 		t.Fatalf("write dirty file: %v", err)
-	}
-}
-
-// assertFileContains checks that the file at path contains the expected string.
-func assertFileContains(t *testing.T, path, expected string) {
-	t.Helper()
-
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file %s: %v", path, err)
-	}
-
-	if !strings.Contains(string(content), expected) {
-		t.Errorf("expected file %s to contain %q, got:\n%s", path, expected, content)
-	}
-}
-
-// assertFileNotContains checks that the file at path does not contain the given string.
-func assertFileNotContains(t *testing.T, path, notExpected string) {
-	t.Helper()
-
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file %s: %v", path, err)
-	}
-
-	if strings.Contains(string(content), notExpected) {
-		t.Errorf("expected file %s to NOT contain %q, but it does", path, notExpected)
 	}
 }

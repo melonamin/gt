@@ -345,13 +345,6 @@ func runGitCmd(ctx context.Context, dir string, args ...string) ([]byte, error) 
 	return output, err
 }
 
-// runGitCmdWithTimeout executes a git command with a timeout.
-func runGitCmdWithTimeout(dir string, timeout time.Duration, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	return runGitCmd(ctx, dir, args...)
-}
-
 func runGitCmdCombined(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if dir != "" {
@@ -1458,11 +1451,11 @@ func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, confi
 
 	// Create worktree with new branch from source branch
 	args := []string{"worktree", "add", "-b", worktreeName, worktreePath, sourceBranch}
-	output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
+	_, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 	if err != nil {
 		// If branch already exists, try without -b flag
 		args = []string{"worktree", "add", worktreePath, worktreeName}
-		output, err = runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
+		output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 		if err != nil {
 			return fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
 		}
