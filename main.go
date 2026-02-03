@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,6 +35,9 @@ const (
 	hashDisplayLength    = 7
 	branchDisplayWidth   = 20
 	ellipsis             = "..."
+	commitDetailShare    = 0.6
+	minCommitDetailWidth = 10
+	minPathDetailWidth   = 8
 
 	// Git command timeouts
 	gitCmdTimeout     = 5 * time.Second
@@ -300,6 +304,127 @@ func truncateStringByWidth(s string, maxWidth int) string {
 		width += rw
 	}
 	return b.String() + ellipsis
+}
+
+func tailStringByWidth(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxWidth {
+		return s
+	}
+
+	runes := []rune(s)
+	width := 0
+	i := len(runes)
+	for i > 0 {
+		rw := runewidth.RuneWidth(runes[i-1])
+		if width+rw > maxWidth {
+			break
+		}
+		width += rw
+		i--
+	}
+	return string(runes[i:])
+}
+
+func truncatePathTail(path string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	clean := filepath.ToSlash(path)
+	if lipgloss.Width(clean) <= maxWidth {
+		return clean
+	}
+	if maxWidth <= lipgloss.Width(ellipsis) {
+		return strings.Repeat(".", maxWidth)
+	}
+
+	parts := strings.Split(clean, "/")
+	filtered := parts[:0]
+	for _, part := range parts {
+		if part != "" {
+			filtered = append(filtered, part)
+		}
+	}
+	if len(filtered) == 0 {
+		return truncateStringByWidth(clean, maxWidth)
+	}
+
+	prefix := ellipsis + "/"
+	remainingWidth := maxWidth - lipgloss.Width(prefix)
+	if remainingWidth <= 0 {
+		return strings.Repeat(".", maxWidth)
+	}
+
+	tail := filtered[len(filtered)-1]
+	if lipgloss.Width(tail) > remainingWidth {
+		return prefix + tailStringByWidth(tail, remainingWidth)
+	}
+
+	for i := len(filtered) - 2; i >= 0; i-- {
+		candidate := filtered[i] + "/" + tail
+		if lipgloss.Width(candidate)+lipgloss.Width(prefix) > maxWidth {
+			break
+		}
+		tail = candidate
+	}
+
+	return prefix + tail
+}
+
+func formatWorktreeDetail(commitText, subPath string, showSubPath bool, maxWidth int) string {
+	if maxWidth <= 0 {
+		if showSubPath {
+			return fmt.Sprintf("%s (%s)", commitText, subPath)
+		}
+		return commitText
+	}
+
+	if !showSubPath {
+		return truncateStringByWidth(commitText, maxWidth)
+	}
+
+	overheadWidth := lipgloss.Width(" ()")
+	availableWidth := maxWidth - overheadWidth
+	if availableWidth <= 0 {
+		return truncateStringByWidth(commitText, maxWidth)
+	}
+
+	commitAlloc := int(math.Round(float64(availableWidth) * commitDetailShare))
+	pathAlloc := availableWidth - commitAlloc
+	if availableWidth >= minCommitDetailWidth+minPathDetailWidth {
+		if commitAlloc < minCommitDetailWidth {
+			commitAlloc = minCommitDetailWidth
+		}
+		if pathAlloc < minPathDetailWidth {
+			pathAlloc = minPathDetailWidth
+		}
+		if commitAlloc+pathAlloc > availableWidth {
+			overflow := commitAlloc + pathAlloc - availableWidth
+			if commitAlloc >= pathAlloc {
+				commitAlloc -= overflow
+			} else {
+				pathAlloc -= overflow
+			}
+		}
+	} else {
+		commitAlloc = availableWidth / 2
+		if commitAlloc < 1 {
+			commitAlloc = 1
+		}
+		pathAlloc = availableWidth - commitAlloc
+		if pathAlloc < 1 {
+			pathAlloc = 1
+			if commitAlloc > 1 {
+				commitAlloc--
+			}
+		}
+	}
+
+	commitText = truncateStringByWidth(commitText, commitAlloc)
+	pathText := truncatePathTail(subPath, pathAlloc)
+	return fmt.Sprintf("%s (%s)", commitText, pathText)
 }
 
 func worktreeDirForConfig(repoPath string, config *Config) string {
@@ -1873,12 +1998,6 @@ func (m model) View() string {
 				}
 			}
 
-			detailText := commitText
-			sep := " · "
-			if showSubPath {
-				detailText = subPath + sep + commitText
-			}
-
 			// Format line
 			prefix := fmt.Sprintf("%s%-*s %s%s  ",
 				cursor,
@@ -1887,28 +2006,11 @@ func (m model) View() string {
 				status,
 				aheadBehind,
 			)
+			maxDetailWidth := 0
 			if m.ui.width > 0 {
-				maxDetailWidth := m.ui.width - lipgloss.Width(prefix)
-				if maxDetailWidth > 0 && lipgloss.Width(detailText) > maxDetailWidth {
-					if showSubPath {
-						commitWidth := lipgloss.Width(commitText)
-						sepWidth := lipgloss.Width(sep)
-						if commitWidth >= maxDetailWidth {
-							detailText = truncateStringByWidth(commitText, maxDetailWidth)
-						} else {
-							pathWidth := maxDetailWidth - commitWidth - sepWidth
-							if pathWidth <= 0 {
-								detailText = truncateStringByWidth(commitText, maxDetailWidth)
-							} else {
-								truncatedPath := truncateStringByWidth(subPath, pathWidth)
-								detailText = truncatedPath + sep + commitText
-							}
-						}
-					} else {
-						detailText = truncateStringByWidth(detailText, maxDetailWidth)
-					}
-				}
+				maxDetailWidth = m.ui.width - lipgloss.Width(prefix)
 			}
+			detailText := formatWorktreeDetail(commitText, subPath, showSubPath, maxDetailWidth)
 
 			line := fmt.Sprintf("%s%s",
 				prefix,

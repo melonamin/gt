@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestEnsureGitExcludeEntryAddsEntry(t *testing.T) {
@@ -124,6 +126,45 @@ func TestTruncateString(t *testing.T) {
 				t.Errorf("truncateString(%q, %d) = %q, want %q", tt.input, tt.maxLen, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTruncatePathTail(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		maxWidth int
+		want     string
+	}{
+		{"fits without truncation", "worktrees/feature", 30, "worktrees/feature"},
+		{"truncates to last segment", "worktrees/feature", 8, ".../ture"},
+		{"keeps last segment", "custom/worktrees/feature-branch", 18, ".../feature-branch"},
+		{"truncates long last segment", "custom/worktrees/feature-branch", 14, ".../ure-branch"},
+		{"very small width", "custom/worktrees/feature-branch", 3, "..."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncatePathTail(tt.path, tt.maxWidth)
+			if got != tt.want {
+				t.Errorf("truncatePathTail(%q, %d) = %q, want %q", tt.path, tt.maxWidth, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatWorktreeDetail(t *testing.T) {
+	commitText := "Fix crash (2h ago)"
+	subPath := "custom/worktrees/feature-branch"
+
+	got := formatWorktreeDetail(commitText, subPath, true, 28)
+	want := "Fix crash (2... (.../branch)"
+	if got != want {
+		t.Errorf("formatWorktreeDetail() = %q, want %q", got, want)
+	}
+
+	if width := lipgloss.Width(got); width > 28 {
+		t.Errorf("formatWorktreeDetail() width = %d, want <= 28", width)
 	}
 }
 
