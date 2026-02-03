@@ -16,6 +16,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 const (
@@ -274,6 +275,63 @@ func truncateString(s string, maxLen int) string {
 	}
 	runes := []rune(s)
 	return string(runes[:maxLen]) + ellipsis
+}
+
+func truncateStringByWidth(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxWidth {
+		return s
+	}
+	if maxWidth <= lipgloss.Width(ellipsis) {
+		return strings.Repeat(".", maxWidth)
+	}
+
+	var b strings.Builder
+	width := 0
+	limit := maxWidth - lipgloss.Width(ellipsis)
+	for _, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if width+rw > limit {
+			break
+		}
+		b.WriteRune(r)
+		width += rw
+	}
+	return b.String() + ellipsis
+}
+
+func worktreeDirForConfig(repoPath string, config *Config) string {
+	worktreeDir := defaultWorktreeDir
+	if config != nil && config.WorktreeDir != "" {
+		worktreeDir = config.WorktreeDir
+	}
+	if !filepath.IsAbs(worktreeDir) {
+		worktreeDir = filepath.Join(repoPath, worktreeDir)
+	}
+	return filepath.Clean(worktreeDir)
+}
+
+func expectedWorktreePath(repoPath, branch string, config *Config) string {
+	if branch == "" {
+		return ""
+	}
+	worktreeDir := worktreeDirForConfig(repoPath, config)
+	worktreeName := strings.ReplaceAll(branch, "/", "-")
+	return filepath.Clean(filepath.Join(worktreeDir, worktreeName))
+}
+
+func worktreeSubPath(repoPath string, config *Config, worktreePath string) string {
+	cleanPath := filepath.Clean(worktreePath)
+	worktreeDir := worktreeDirForConfig(repoPath, config)
+	if rel, err := filepath.Rel(worktreeDir, cleanPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel)
+	}
+	if rel, err := filepath.Rel(repoPath, cleanPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel)
+	}
+	return filepath.ToSlash(cleanPath)
 }
 
 func getConfigPath() string {
@@ -1803,15 +1861,58 @@ func (m model) View() string {
 			// Commit info
 			commitMsg := truncateString(wt.LastCommit.Message, maxCommitMsgLength)
 			relTime := formatRelativeTime(wt.LastCommit.Date)
+			commitText := fmt.Sprintf("%s (%s)", commitMsg, relTime)
+
+			showSubPath := false
+			subPath := ""
+			if expected := expectedWorktreePath(m.repoPath, wt.Branch, m.config); expected != "" {
+				actualPath := filepath.Clean(wt.Path)
+				if actualPath != expected {
+					showSubPath = true
+					subPath = worktreeSubPath(m.repoPath, m.config, actualPath)
+				}
+			}
+
+			detailText := commitText
+			sep := " · "
+			if showSubPath {
+				detailText = subPath + sep + commitText
+			}
 
 			// Format line
-			line := fmt.Sprintf("%s%-*s %s%s  %s",
+			prefix := fmt.Sprintf("%s%-*s %s%s  ",
 				cursor,
 				branchDisplayWidth,
 				branch,
 				status,
 				aheadBehind,
-				dimStyle.Render(fmt.Sprintf("%s (%s)", commitMsg, relTime)),
+			)
+			if m.ui.width > 0 {
+				maxDetailWidth := m.ui.width - lipgloss.Width(prefix)
+				if maxDetailWidth > 0 && lipgloss.Width(detailText) > maxDetailWidth {
+					if showSubPath {
+						commitWidth := lipgloss.Width(commitText)
+						sepWidth := lipgloss.Width(sep)
+						if commitWidth >= maxDetailWidth {
+							detailText = truncateStringByWidth(commitText, maxDetailWidth)
+						} else {
+							pathWidth := maxDetailWidth - commitWidth - sepWidth
+							if pathWidth <= 0 {
+								detailText = truncateStringByWidth(commitText, maxDetailWidth)
+							} else {
+								truncatedPath := truncateStringByWidth(subPath, pathWidth)
+								detailText = truncatedPath + sep + commitText
+							}
+						}
+					} else {
+						detailText = truncateStringByWidth(detailText, maxDetailWidth)
+					}
+				}
+			}
+
+			line := fmt.Sprintf("%s%s",
+				prefix,
+				dimStyle.Render(detailText),
 			)
 
 			if i == m.ui.cursor {
