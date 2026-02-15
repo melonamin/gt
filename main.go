@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +17,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
+
 )
 
 const (
@@ -35,9 +35,7 @@ const (
 	hashDisplayLength    = 7
 	branchDisplayWidth   = 20
 	ellipsis             = "..."
-	commitDetailShare    = 0.6
-	minCommitDetailWidth = 10
-	minPathDetailWidth   = 8
+
 
 	// Git command timeouts
 	gitCmdTimeout     = 5 * time.Second
@@ -281,150 +279,42 @@ func truncateString(s string, maxLen int) string {
 	return string(runes[:maxLen]) + ellipsis
 }
 
-func truncateStringByWidth(s string, maxWidth int) string {
+// truncateToWidth truncates a string to fit within maxWidth display columns,
+// adding an ellipsis suffix if truncation is needed.
+func truncateToWidth(s string, maxWidth int) string {
 	if maxWidth <= 0 {
 		return ""
 	}
 	if lipgloss.Width(s) <= maxWidth {
 		return s
 	}
-	if maxWidth <= lipgloss.Width(ellipsis) {
-		return strings.Repeat(".", maxWidth)
+	ellipsisWidth := lipgloss.Width(ellipsis)
+	if maxWidth <= ellipsisWidth {
+		return ellipsis[:maxWidth]
 	}
-
-	var b strings.Builder
-	width := 0
-	limit := maxWidth - lipgloss.Width(ellipsis)
-	for _, r := range s {
-		rw := runewidth.RuneWidth(r)
-		if width+rw > limit {
-			break
-		}
-		b.WriteRune(r)
-		width += rw
-	}
-	return b.String() + ellipsis
-}
-
-func tailStringByWidth(s string, maxWidth int) string {
-	if maxWidth <= 0 {
-		return ""
-	}
-	if lipgloss.Width(s) <= maxWidth {
-		return s
-	}
-
 	runes := []rune(s)
 	width := 0
-	i := len(runes)
-	for i > 0 {
-		rw := runewidth.RuneWidth(runes[i-1])
-		if width+rw > maxWidth {
-			break
+	for i, r := range runes {
+		rw := lipgloss.Width(string(r))
+		if width+rw > maxWidth-ellipsisWidth {
+			return string(runes[:i]) + ellipsis
 		}
 		width += rw
-		i--
 	}
-	return string(runes[i:])
-}
-
-func truncatePathTail(path string, maxWidth int) string {
-	if maxWidth <= 0 {
-		return ""
-	}
-	clean := filepath.ToSlash(path)
-	if lipgloss.Width(clean) <= maxWidth {
-		return clean
-	}
-	if maxWidth <= lipgloss.Width(ellipsis) {
-		return strings.Repeat(".", maxWidth)
-	}
-
-	parts := strings.Split(clean, "/")
-	filtered := parts[:0]
-	for _, part := range parts {
-		if part != "" {
-			filtered = append(filtered, part)
-		}
-	}
-	if len(filtered) == 0 {
-		return truncateStringByWidth(clean, maxWidth)
-	}
-
-	prefix := ellipsis + "/"
-	remainingWidth := maxWidth - lipgloss.Width(prefix)
-	if remainingWidth <= 0 {
-		return strings.Repeat(".", maxWidth)
-	}
-
-	tail := filtered[len(filtered)-1]
-	if lipgloss.Width(tail) > remainingWidth {
-		return prefix + tailStringByWidth(tail, remainingWidth)
-	}
-
-	for i := len(filtered) - 2; i >= 0; i-- {
-		candidate := filtered[i] + "/" + tail
-		if lipgloss.Width(candidate)+lipgloss.Width(prefix) > maxWidth {
-			break
-		}
-		tail = candidate
-	}
-
-	return prefix + tail
+	return s
 }
 
 func formatWorktreeDetail(commitText, subPath string, showSubPath bool, maxWidth int) string {
-	if maxWidth <= 0 {
-		if showSubPath {
-			return fmt.Sprintf("%s (%s)", commitText, subPath)
+	if showSubPath {
+		full := fmt.Sprintf("%s (%s)", commitText, subPath)
+		if maxWidth <= 0 || lipgloss.Width(full) <= maxWidth {
+			return full
 		}
+	}
+	if maxWidth <= 0 {
 		return commitText
 	}
-
-	if !showSubPath {
-		return truncateStringByWidth(commitText, maxWidth)
-	}
-
-	overheadWidth := lipgloss.Width(" ()")
-	availableWidth := maxWidth - overheadWidth
-	if availableWidth <= 0 {
-		return truncateStringByWidth(commitText, maxWidth)
-	}
-
-	commitAlloc := int(math.Round(float64(availableWidth) * commitDetailShare))
-	pathAlloc := availableWidth - commitAlloc
-	if availableWidth >= minCommitDetailWidth+minPathDetailWidth {
-		if commitAlloc < minCommitDetailWidth {
-			commitAlloc = minCommitDetailWidth
-		}
-		if pathAlloc < minPathDetailWidth {
-			pathAlloc = minPathDetailWidth
-		}
-		if commitAlloc+pathAlloc > availableWidth {
-			overflow := commitAlloc + pathAlloc - availableWidth
-			if commitAlloc >= pathAlloc {
-				commitAlloc -= overflow
-			} else {
-				pathAlloc -= overflow
-			}
-		}
-	} else {
-		commitAlloc = availableWidth / 2
-		if commitAlloc < 1 {
-			commitAlloc = 1
-		}
-		pathAlloc = availableWidth - commitAlloc
-		if pathAlloc < 1 {
-			pathAlloc = 1
-			if commitAlloc > 1 {
-				commitAlloc--
-			}
-		}
-	}
-
-	commitText = truncateStringByWidth(commitText, commitAlloc)
-	pathText := truncatePathTail(subPath, pathAlloc)
-	return fmt.Sprintf("%s (%s)", commitText, pathText)
+	return truncateToWidth(commitText, maxWidth)
 }
 
 func worktreeDirForConfig(repoPath string, config *Config) string {

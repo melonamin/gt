@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+
 )
 
 func TestEnsureGitExcludeEntryAddsEntry(t *testing.T) {
@@ -129,42 +129,72 @@ func TestTruncateString(t *testing.T) {
 	}
 }
 
-func TestTruncatePathTail(t *testing.T) {
+func TestFormatWorktreeDetail(t *testing.T) {
 	tests := []struct {
-		name     string
-		path     string
-		maxWidth int
-		want     string
+		name        string
+		commitText  string
+		subPath     string
+		showSubPath bool
+		maxWidth    int
+		want        string
 	}{
-		{"fits without truncation", "worktrees/feature", 30, "worktrees/feature"},
-		{"truncates to last segment", "worktrees/feature", 8, ".../ture"},
-		{"keeps last segment", "custom/worktrees/feature-branch", 18, ".../feature-branch"},
-		{"truncates long last segment", "custom/worktrees/feature-branch", 14, ".../ure-branch"},
-		{"very small width", "custom/worktrees/feature-branch", 3, "..."},
+		{
+			name:        "shows subpath when it fits",
+			commitText:  "Fix crash (2h ago)",
+			subPath:     "my-tree",
+			showSubPath: true,
+			maxWidth:    40,
+			want:        "Fix crash (2h ago) (my-tree)",
+		},
+		{
+			name:        "hides subpath when it does not fit",
+			commitText:  "Fix crash (2h ago)",
+			subPath:     "custom/worktrees/feature-branch",
+			showSubPath: true,
+			maxWidth:    28,
+			want:        "Fix crash (2h ago)",
+		},
+		{
+			name:        "truncates commit text when no subpath",
+			commitText:  "Fix crash (2h ago)",
+			subPath:     "",
+			showSubPath: false,
+			maxWidth:    12,
+			want:        "Fix crash...",
+		},
+		{
+			name:        "truncates commit text when subpath hidden due to space",
+			commitText:  "A very long commit message (2h ago)",
+			subPath:     "worktrees/feature",
+			showSubPath: true,
+			maxWidth:    20,
+			want:        "A very long commi...",
+		},
+		{
+			name:        "no width limit with subpath",
+			commitText:  "Fix crash (2h ago)",
+			subPath:     "worktrees/feature",
+			showSubPath: true,
+			maxWidth:    0,
+			want:        "Fix crash (2h ago) (worktrees/feature)",
+		},
+		{
+			name:        "no width limit without subpath",
+			commitText:  "Fix crash (2h ago)",
+			subPath:     "",
+			showSubPath: false,
+			maxWidth:    0,
+			want:        "Fix crash (2h ago)",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := truncatePathTail(tt.path, tt.maxWidth)
+			got := formatWorktreeDetail(tt.commitText, tt.subPath, tt.showSubPath, tt.maxWidth)
 			if got != tt.want {
-				t.Errorf("truncatePathTail(%q, %d) = %q, want %q", tt.path, tt.maxWidth, got, tt.want)
+				t.Errorf("formatWorktreeDetail() = %q, want %q", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestFormatWorktreeDetail(t *testing.T) {
-	commitText := "Fix crash (2h ago)"
-	subPath := "custom/worktrees/feature-branch"
-
-	got := formatWorktreeDetail(commitText, subPath, true, 28)
-	want := "Fix crash (2... (.../branch)"
-	if got != want {
-		t.Errorf("formatWorktreeDetail() = %q, want %q", got, want)
-	}
-
-	if width := lipgloss.Width(got); width > 28 {
-		t.Errorf("formatWorktreeDetail() width = %d, want <= 28", width)
 	}
 }
 
