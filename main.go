@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-
 )
 
 const (
@@ -35,7 +33,6 @@ const (
 	hashDisplayLength    = 7
 	branchDisplayWidth   = 20
 	ellipsis             = "..."
-
 
 	// Git command timeouts
 	gitCmdTimeout     = 5 * time.Second
@@ -162,15 +159,16 @@ type mergeState struct {
 
 // model is the Bubble Tea model for the TUI application.
 type model struct {
-	ui       uiState
-	wt       worktreeState
-	acts     actionsState
-	del      deleteState
-	merge    mergeState
-	repoPath string
-	config   *Config
-	err      error
-	status   struct {
+	ui              uiState
+	wt              worktreeState
+	acts            actionsState
+	del             deleteState
+	merge           mergeState
+	repoPath        string
+	mainWorktreeDir string
+	config          *Config
+	err             error
+	status          struct {
 		message string
 		isError bool
 		timeout time.Time
@@ -304,19 +302,6 @@ func truncateToWidth(s string, maxWidth int) string {
 	return s
 }
 
-func formatWorktreeDetail(commitText, subPath string, showSubPath bool, maxWidth int) string {
-	if showSubPath {
-		full := fmt.Sprintf("%s (%s)", commitText, subPath)
-		if maxWidth <= 0 || lipgloss.Width(full) <= maxWidth {
-			return full
-		}
-	}
-	if maxWidth <= 0 {
-		return commitText
-	}
-	return truncateToWidth(commitText, maxWidth)
-}
-
 func worktreeDirForConfig(repoPath string, config *Config) string {
 	worktreeDir := defaultWorktreeDir
 	if config != nil && config.WorktreeDir != "" {
@@ -328,22 +313,24 @@ func worktreeDirForConfig(repoPath string, config *Config) string {
 	return filepath.Clean(worktreeDir)
 }
 
-func expectedWorktreePath(repoPath, branch string, config *Config) string {
-	if branch == "" {
-		return ""
+// isExpectedWorktreePath checks whether the worktree folder name matches
+// the convention for the given branch (slashes replaced with dashes).
+func isExpectedWorktreePath(branch, worktreePath string) bool {
+	if branch == "" || worktreePath == "" {
+		return true
 	}
-	worktreeDir := worktreeDirForConfig(repoPath, config)
-	worktreeName := strings.ReplaceAll(branch, "/", "-")
-	return filepath.Clean(filepath.Join(worktreeDir, worktreeName))
+	expectedName := strings.ReplaceAll(branch, "/", "-")
+	actualName := filepath.Base(filepath.Clean(worktreePath))
+	return actualName == expectedName
 }
 
-func worktreeSubPath(repoPath string, config *Config, worktreePath string) string {
+func worktreeSubPath(mainWorktreeDir string, config *Config, worktreePath string) string {
 	cleanPath := filepath.Clean(worktreePath)
-	worktreeDir := worktreeDirForConfig(repoPath, config)
+	worktreeDir := worktreeDirForConfig(mainWorktreeDir, config)
 	if rel, err := filepath.Rel(worktreeDir, cleanPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
 		return filepath.ToSlash(rel)
 	}
-	if rel, err := filepath.Rel(repoPath, cleanPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+	if rel, err := filepath.Rel(mainWorktreeDir, cleanPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
 		return filepath.ToSlash(rel)
 	}
 	return filepath.ToSlash(cleanPath)
@@ -787,9 +774,10 @@ func tickCmd() tea.Cmd {
 
 // worktreesLoadedMsg is sent when async worktree loading completes.
 type worktreesLoadedMsg struct {
-	worktrees     []Worktree
-	defaultBranch string
-	err           error
+	worktrees       []Worktree
+	defaultBranch   string
+	mainWorktreeDir string
+	err             error
 }
 
 // worktreeDetailLoadedMsg reports incremental detail updates for a single worktree.
@@ -836,10 +824,15 @@ func loadWorktreesCmd(repoPath string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
 		defer cancel()
 		worktrees, defaultBranch, err := listWorktreesWithContext(ctx, repoPath)
+		var mainDir string
+		if len(worktrees) > 0 {
+			mainDir = worktrees[0].Path
+		}
 		return worktreesLoadedMsg{
-			worktrees:     worktrees,
-			defaultBranch: defaultBranch,
-			err:           err,
+			worktrees:       worktrees,
+			defaultBranch:   defaultBranch,
+			mainWorktreeDir: mainDir,
+			err:             err,
 		}
 	}
 }
@@ -1289,6 +1282,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.wt.worktrees = msg.worktrees
 		m.wt.filtered = filterWorktrees(msg.worktrees, m.wt.searchTerm)
 		m.wt.defaultBranch = msg.defaultBranch
+		m.mainWorktreeDir = msg.mainWorktreeDir
 		m.wt.detailGeneration++
 		m.resetDetailQueue()
 		// Find current worktree path for tracking previous (session-only)
@@ -1854,6 +1848,21 @@ func (m model) View() string {
 				branch = branchStyle.Render(branch)
 			}
 
+			// Worktree folder path — only for non-main worktrees with unexpected names
+			isMainWorktree := filepath.Clean(wt.Path) == filepath.Clean(m.mainWorktreeDir)
+			showSubPath := false
+			subPath := ""
+			if !isMainWorktree && !isExpectedWorktreePath(wt.Branch, wt.Path) {
+				showSubPath = true
+				subPath = worktreeSubPath(m.mainWorktreeDir, m.config, wt.Path)
+			}
+
+			// Folder path label (placed after branch name)
+			folderLabel := ""
+			if showSubPath {
+				folderLabel = " " + dimStyle.Render(fmt.Sprintf("(%s)", subPath))
+			}
+
 			// Status indicator
 			status := "✓"
 			if wt.IsDirty {
@@ -1878,21 +1887,12 @@ func (m model) View() string {
 			relTime := formatRelativeTime(wt.LastCommit.Date)
 			commitText := fmt.Sprintf("%s (%s)", commitMsg, relTime)
 
-			showSubPath := false
-			subPath := ""
-			if expected := expectedWorktreePath(m.repoPath, wt.Branch, m.config); expected != "" {
-				actualPath := filepath.Clean(wt.Path)
-				if actualPath != expected {
-					showSubPath = true
-					subPath = worktreeSubPath(m.repoPath, m.config, actualPath)
-				}
-			}
-
-			// Format line
-			prefix := fmt.Sprintf("%s%-*s %s%s  ",
+			// Format line: cursor branch (folder) status ahead/behind  commit
+			prefix := fmt.Sprintf("%s%-*s%s %s%s  ",
 				cursor,
 				branchDisplayWidth,
 				branch,
+				folderLabel,
 				status,
 				aheadBehind,
 			)
@@ -1900,7 +1900,7 @@ func (m model) View() string {
 			if m.ui.width > 0 {
 				maxDetailWidth = m.ui.width - lipgloss.Width(prefix)
 			}
-			detailText := formatWorktreeDetail(commitText, subPath, showSubPath, maxDetailWidth)
+			detailText := truncateToWidth(commitText, maxDetailWidth)
 
 			line := fmt.Sprintf("%s%s",
 				prefix,

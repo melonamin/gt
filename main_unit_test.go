@@ -5,8 +5,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-
 )
 
 func TestEnsureGitExcludeEntryAddsEntry(t *testing.T) {
@@ -129,70 +127,48 @@ func TestTruncateString(t *testing.T) {
 	}
 }
 
-func TestFormatWorktreeDetail(t *testing.T) {
+func TestIsExpectedWorktreePath(t *testing.T) {
 	tests := []struct {
-		name        string
-		commitText  string
-		subPath     string
-		showSubPath bool
-		maxWidth    int
-		want        string
+		name         string
+		branch       string
+		worktreePath string
+		want         bool
 	}{
-		{
-			name:        "shows subpath when it fits",
-			commitText:  "Fix crash (2h ago)",
-			subPath:     "my-tree",
-			showSubPath: true,
-			maxWidth:    40,
-			want:        "Fix crash (2h ago) (my-tree)",
-		},
-		{
-			name:        "hides subpath when it does not fit",
-			commitText:  "Fix crash (2h ago)",
-			subPath:     "custom/worktrees/feature-branch",
-			showSubPath: true,
-			maxWidth:    28,
-			want:        "Fix crash (2h ago)",
-		},
-		{
-			name:        "truncates commit text when no subpath",
-			commitText:  "Fix crash (2h ago)",
-			subPath:     "",
-			showSubPath: false,
-			maxWidth:    12,
-			want:        "Fix crash...",
-		},
-		{
-			name:        "truncates commit text when subpath hidden due to space",
-			commitText:  "A very long commit message (2h ago)",
-			subPath:     "worktrees/feature",
-			showSubPath: true,
-			maxWidth:    20,
-			want:        "A very long commi...",
-		},
-		{
-			name:        "no width limit with subpath",
-			commitText:  "Fix crash (2h ago)",
-			subPath:     "worktrees/feature",
-			showSubPath: true,
-			maxWidth:    0,
-			want:        "Fix crash (2h ago) (worktrees/feature)",
-		},
-		{
-			name:        "no width limit without subpath",
-			commitText:  "Fix crash (2h ago)",
-			subPath:     "",
-			showSubPath: false,
-			maxWidth:    0,
-			want:        "Fix crash (2h ago)",
-		},
+		{"matching simple branch", "add-orm", "/repo/.worktrees/add-orm", true},
+		{"matching branch with slash", "feature/login", "/repo/.worktrees/feature-login", true},
+		{"non-matching folder", "add-orm", "/repo/.worktrees/custom-name", false},
+		{"empty branch", "", "/repo/.worktrees/whatever", true},
+		{"empty path", "main", "", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := formatWorktreeDetail(tt.commitText, tt.subPath, tt.showSubPath, tt.maxWidth)
+			got := isExpectedWorktreePath(tt.branch, tt.worktreePath)
 			if got != tt.want {
-				t.Errorf("formatWorktreeDetail() = %q, want %q", got, tt.want)
+				t.Errorf("isExpectedWorktreePath(%q, %q) = %v, want %v", tt.branch, tt.worktreePath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTruncateToWidth(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxWidth int
+		want     string
+	}{
+		{"fits within width", "hello", 10, "hello"},
+		{"truncates with ellipsis", "Fix crash (2h ago)", 12, "Fix crash..."},
+		{"zero width", "hello", 0, ""},
+		{"very small width", "hello world", 3, "..."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateToWidth(tt.input, tt.maxWidth)
+			if got != tt.want {
+				t.Errorf("truncateToWidth(%q, %d) = %q, want %q", tt.input, tt.maxWidth, got, tt.want)
 			}
 		})
 	}
