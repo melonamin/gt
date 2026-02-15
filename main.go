@@ -1857,28 +1857,35 @@ func (m model) View() string {
 			relTime := formatRelativeTime(wt.LastCommit.Date)
 			commitText := fmt.Sprintf("%s (%s)", commitMsg, relTime)
 
-			// Build folder label: "📂 name" if it fits, just "📂" if tight
+			// Build folder label: "[📂 name]" if it fits, just "[📂]" if tight
 			folderLabel := ""
 			if hasFolderMismatch {
-				statusSuffix := fmt.Sprintf(" %s%s  ", status, aheadBehind)
+				tail := fmt.Sprintf(" │ %s%s  ", status, aheadBehind)
 				basePrefix := fmt.Sprintf("%s%-*s", cursor, branchDisplayWidth, branch)
-				basePrefixWidth := lipgloss.Width(basePrefix) + lipgloss.Width(statusSuffix)
+				basePrefixWidth := lipgloss.Width(basePrefix) + lipgloss.Width(tail)
 
-				fullLabel := " " + dimStyle.Render("📂 "+folderName)
+				fullLabel := " " + dimStyle.Render("[📂 "+folderName+"]")
 				commitWidth := lipgloss.Width(commitText)
 				if m.ui.width <= 0 || basePrefixWidth+lipgloss.Width(fullLabel)+commitWidth <= m.ui.width {
 					folderLabel = fullLabel
 				} else {
-					folderLabel = " " + dimStyle.Render("📂")
+					folderLabel = " " + dimStyle.Render("[📂]")
 				}
 			}
 
-			// Format line: cursor branch [📂 name] status ahead/behind  commit
-			prefix := fmt.Sprintf("%s%-*s%s %s%s  ",
+			// Format line: cursor branch [📂 name] │ status ahead/behind  commit
+			var separator string
+			if hasFolderMismatch {
+				separator = " │ "
+			} else {
+				separator = " "
+			}
+			prefix := fmt.Sprintf("%s%-*s%s%s%s%s ",
 				cursor,
 				branchDisplayWidth,
 				branch,
 				folderLabel,
+				separator,
 				status,
 				aheadBehind,
 			)
