@@ -302,17 +302,6 @@ func truncateToWidth(s string, maxWidth int) string {
 	return s
 }
 
-func worktreeDirForConfig(repoPath string, config *Config) string {
-	worktreeDir := defaultWorktreeDir
-	if config != nil && config.WorktreeDir != "" {
-		worktreeDir = config.WorktreeDir
-	}
-	if !filepath.IsAbs(worktreeDir) {
-		worktreeDir = filepath.Join(repoPath, worktreeDir)
-	}
-	return filepath.Clean(worktreeDir)
-}
-
 // isExpectedWorktreePath checks whether the worktree folder name matches
 // the convention for the given branch (slashes replaced with dashes).
 func isExpectedWorktreePath(branch, worktreePath string) bool {
@@ -322,18 +311,6 @@ func isExpectedWorktreePath(branch, worktreePath string) bool {
 	expectedName := strings.ReplaceAll(branch, "/", "-")
 	actualName := filepath.Base(filepath.Clean(worktreePath))
 	return actualName == expectedName
-}
-
-func worktreeSubPath(mainWorktreeDir string, config *Config, worktreePath string) string {
-	cleanPath := filepath.Clean(worktreePath)
-	worktreeDir := worktreeDirForConfig(mainWorktreeDir, config)
-	if rel, err := filepath.Rel(worktreeDir, cleanPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
-		return filepath.ToSlash(rel)
-	}
-	if rel, err := filepath.Rel(mainWorktreeDir, cleanPath); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
-		return filepath.ToSlash(rel)
-	}
-	return filepath.ToSlash(cleanPath)
 }
 
 func getConfigPath() string {
@@ -1848,19 +1825,11 @@ func (m model) View() string {
 				branch = branchStyle.Render(branch)
 			}
 
-			// Worktree folder path — only for non-main worktrees with unexpected names
+			// Folder mismatch indicator — shown when folder name doesn't match branch
 			isMainWorktree := filepath.Clean(wt.Path) == filepath.Clean(m.mainWorktreeDir)
-			showSubPath := false
-			subPath := ""
+			folderIndicator := ""
 			if !isMainWorktree && !isExpectedWorktreePath(wt.Branch, wt.Path) {
-				showSubPath = true
-				subPath = worktreeSubPath(m.mainWorktreeDir, m.config, wt.Path)
-			}
-
-			// Folder path label (placed after branch name)
-			folderLabel := ""
-			if showSubPath {
-				folderLabel = " " + dimStyle.Render(fmt.Sprintf("(%s)", subPath))
+				folderIndicator = " " + dimStyle.Render("⧉")
 			}
 
 			// Status indicator
@@ -1887,12 +1856,12 @@ func (m model) View() string {
 			relTime := formatRelativeTime(wt.LastCommit.Date)
 			commitText := fmt.Sprintf("%s (%s)", commitMsg, relTime)
 
-			// Format line: cursor branch (folder) status ahead/behind  commit
+			// Format line: cursor branch [⧉] status ahead/behind  commit
 			prefix := fmt.Sprintf("%s%-*s%s %s%s  ",
 				cursor,
 				branchDisplayWidth,
 				branch,
-				folderLabel,
+				folderIndicator,
 				status,
 				aheadBehind,
 			)
