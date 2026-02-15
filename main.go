@@ -1825,11 +1825,12 @@ func (m model) View() string {
 				branch = branchStyle.Render(branch)
 			}
 
-			// Folder mismatch indicator — shown when folder name doesn't match branch
+			// Folder mismatch — shown when folder name doesn't match branch
 			isMainWorktree := filepath.Clean(wt.Path) == filepath.Clean(m.mainWorktreeDir)
-			folderIndicator := ""
-			if !isMainWorktree && !isExpectedWorktreePath(wt.Branch, wt.Path) {
-				folderIndicator = " " + dimStyle.Render("⧉")
+			hasFolderMismatch := !isMainWorktree && !isExpectedWorktreePath(wt.Branch, wt.Path)
+			folderName := ""
+			if hasFolderMismatch {
+				folderName = filepath.Base(filepath.Clean(wt.Path))
 			}
 
 			// Status indicator
@@ -1856,12 +1857,28 @@ func (m model) View() string {
 			relTime := formatRelativeTime(wt.LastCommit.Date)
 			commitText := fmt.Sprintf("%s (%s)", commitMsg, relTime)
 
-			// Format line: cursor branch [⧉] status ahead/behind  commit
+			// Build folder label: "📂 name" if it fits, just "📂" if tight
+			folderLabel := ""
+			if hasFolderMismatch {
+				statusSuffix := fmt.Sprintf(" %s%s  ", status, aheadBehind)
+				basePrefix := fmt.Sprintf("%s%-*s", cursor, branchDisplayWidth, branch)
+				basePrefixWidth := lipgloss.Width(basePrefix) + lipgloss.Width(statusSuffix)
+
+				fullLabel := " " + dimStyle.Render("📂 "+folderName)
+				commitWidth := lipgloss.Width(commitText)
+				if m.ui.width <= 0 || basePrefixWidth+lipgloss.Width(fullLabel)+commitWidth <= m.ui.width {
+					folderLabel = fullLabel
+				} else {
+					folderLabel = " " + dimStyle.Render("📂")
+				}
+			}
+
+			// Format line: cursor branch [📂 name] status ahead/behind  commit
 			prefix := fmt.Sprintf("%s%-*s%s %s%s  ",
 				cursor,
 				branchDisplayWidth,
 				branch,
-				folderIndicator,
+				folderLabel,
 				status,
 				aheadBehind,
 			)
