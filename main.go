@@ -1399,22 +1399,114 @@ func refExists(repoPath, ref string) bool {
 }
 
 func localBranchExists(repoPath, branch string) bool {
-	return refExists(repoPath, branch)
+	return refExists(repoPath, fmt.Sprintf("refs/heads/%s", branch))
 }
 
-func remoteBranchExists(repoPath, branch string) bool {
-	// Fast path: check local tracking ref
-	if refExists(repoPath, fmt.Sprintf("refs/remotes/origin/%s", branch)) {
-		return true
+type remoteBranchMatch struct {
+	remote     string
+	ref        string
+	needsFetch bool
+}
+
+func getCheckoutDefaultRemote(repoPath string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+	output, err := runGitCmd(ctx, repoPath, "config", "--get", "checkout.defaultRemote")
+	if err != nil {
+		return ""
 	}
-	// Slow path: query remote (for unfetched branches)
+	return strings.TrimSpace(string(output))
+}
+
+func listRemotes(repoPath string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+	output, err := runGitCmd(ctx, repoPath, "remote")
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(string(output))
+}
+
+func findRemoteBranch(repoPath, remote, branch string) (*remoteBranchMatch, bool) {
+	if refExists(repoPath, fmt.Sprintf("refs/remotes/%s/%s", remote, branch)) {
+		return &remoteBranchMatch{
+			remote: remote,
+			ref:    fmt.Sprintf("%s/%s", remote, branch),
+		}, true
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
 	defer cancel()
-	output, err := runGitCmd(ctx, repoPath, "ls-remote", "--heads", "origin", branch)
-	return err == nil && len(strings.TrimSpace(string(output))) > 0
+	output, err := runGitCmd(ctx, repoPath, "ls-remote", "--heads", remote, fmt.Sprintf("refs/heads/%s", branch))
+	if err == nil && len(strings.TrimSpace(string(output))) > 0 {
+		return &remoteBranchMatch{
+			remote:     remote,
+			ref:        fmt.Sprintf("%s/%s", remote, branch),
+			needsFetch: true,
+		}, true
+	}
+
+	return nil, false
+}
+
+func fetchRemoteBranch(repoPath, remote, branch string) error {
+	refspec := fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", branch, remote, branch)
+	output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, "fetch", remote, refspec)
+	if err != nil {
+		return fmt.Errorf("failed to fetch %s/%s: %s", remote, branch, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func resolveRemoteBranchForSwitch(repoPath, branch string) (*remoteBranchMatch, error) {
+	remotes := listRemotes(repoPath)
+	if len(remotes) == 0 {
+		return nil, nil
+	}
+
+	defaultRemote := getCheckoutDefaultRemote(repoPath)
+	if defaultRemote != "" {
+		for _, remote := range remotes {
+			if remote == defaultRemote {
+				match, ok := findRemoteBranch(repoPath, remote, branch)
+				if ok {
+					return match, nil
+				}
+			}
+		}
+	}
+
+	var matches []remoteBranchMatch
+	for _, remote := range remotes {
+		if match, ok := findRemoteBranch(repoPath, remote, branch); ok {
+			matches = append(matches, *match)
+		}
+	}
+
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	if len(matches) > 1 {
+		remoteNames := make([]string, 0, len(matches))
+		for _, match := range matches {
+			remoteNames = append(remoteNames, match.remote)
+		}
+		return nil, fmt.Errorf(
+			"branch %q exists on multiple remotes (%s); set checkout.defaultRemote or pass an explicit source branch",
+			branch,
+			strings.Join(remoteNames, ", "),
+		)
+	}
+
+	return &matches[0], nil
 }
 
 func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, config *Config) error {
+	if err := validateBranchName(worktreeName); err != nil {
+		return fmt.Errorf("invalid branch name: %w", err)
+	}
+
 	// Determine worktree directory
 	worktreeDir := defaultWorktreeDir
 	if config != nil && config.WorktreeDir != "" {
@@ -1465,6 +1557,10 @@ func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, confi
 }
 
 func createWorktree(repoPath, branch string, config *Config) error {
+	if err := validateBranchName(branch); err != nil {
+		return fmt.Errorf("invalid branch name: %w", err)
+	}
+
 	// Determine worktree directory
 	worktreeDir := defaultWorktreeDir
 	if config != nil && config.WorktreeDir != "" {
@@ -1501,19 +1597,31 @@ func createWorktree(repoPath, branch string, config *Config) error {
 
 	// Determine best strategy based on existing refs
 	var (
-		args         []string
-		remoteRef    = fmt.Sprintf("origin/%s", branch)
-		localExists  = localBranchExists(repoPath, branch)
-		remoteExists = remoteBranchExists(repoPath, branch)
+		args        []string
+		localExists = localBranchExists(repoPath, branch)
 	)
 
 	switch {
 	case localExists:
 		args = []string{"worktree", "add", worktreePath, branch}
-	case remoteExists:
-		args = []string{"worktree", "add", "--track", "-b", branch, worktreePath, remoteRef}
 	default:
-		args = []string{"worktree", "add", "-b", branch, worktreePath}
+		remoteMatch, err := resolveRemoteBranchForSwitch(repoPath, branch)
+		if err != nil {
+			return err
+		}
+		if remoteMatch != nil {
+			if remoteMatch.needsFetch {
+				if err := fetchRemoteBranch(repoPath, remoteMatch.remote, branch); err != nil {
+					return err
+				}
+			}
+			if !refExists(repoPath, fmt.Sprintf("refs/remotes/%s/%s", remoteMatch.remote, branch)) {
+				return fmt.Errorf("failed to resolve remote branch %s", remoteMatch.ref)
+			}
+			args = []string{"worktree", "add", "--track", "-b", branch, worktreePath, remoteMatch.ref}
+		} else {
+			args = []string{"worktree", "add", "-b", branch, worktreePath}
+		}
 	}
 
 	output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
@@ -1947,7 +2055,7 @@ func printHelp() {
 
 USAGE:
     gt                           Open interactive worktree manager
-    gt <name>                    Create worktree from current branch and switch to it
+    gt <name>                    Create or reuse branch, then switch to its worktree
     gt <name> <branch>           Create worktree from specified branch and switch to it
     gt <name> -x <cmd>           Create worktree and execute command instead of shell
     gt --merge <branch>          Merge worktree branch into default and delete
@@ -1963,12 +2071,20 @@ OPTIONS:
 
 EXAMPLES:
     gt                           # Open TUI to manage worktrees
-    gt feature-xyz               # Create worktree 'feature-xyz' from current branch
+    gt feature-xyz               # Reuse local/remote branch, or create from current branch
     gt fix-bug main              # Create worktree 'fix-bug' from 'main' branch
     gt feature-xyz -x "code ."   # Create worktree and open in VS Code
     gt feature-xyz -x claude     # Create worktree and start Claude Code
     gt --merge feature-xyz       # Merge 'feature-xyz' into main (ff-only)
     gt --merge feature-xyz --squash  # Squash merge into main
+
+BRANCH CREATION:
+    gt <name> reuses an existing local branch when one exists. If no local branch
+    exists, gt follows git switch's remote guess behavior: it uses a matching
+    remote-tracking branch, or fetches a matching branch discovered on exactly
+    one remote or checkout.defaultRemote. If no local or remote branch matches,
+    gt creates a new branch from the current HEAD. gt <name> <branch> always
+    creates <name> from <branch>.
 
 SHELL COMPLETION:
     # Bash: Add to ~/.bashrc
@@ -2029,16 +2145,6 @@ CONFIGURATION:
     }
 `, version)
 	fmt.Print(help)
-}
-
-func getCurrentBranch(repoPath string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
-	cmd.Dir = repoPath
-	output, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(output)), nil
 }
 
 func getDefaultBranchWithContext(ctx context.Context, repoPath string) string {
@@ -2273,25 +2379,12 @@ func main() {
 			config = &Config{}
 		}
 
-		// Determine source branch
-		if sourceBranch == "" {
-			// Use current branch
-			sourceBranch, err = getCurrentBranch(repoPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting current branch: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
 		// Create the worktree
-		fmt.Printf("Creating worktree '%s' from branch '%s'...\n", worktreeName, sourceBranch)
-
-		// First check if we need to create from an existing branch or create new
-		if sourceBranch != worktreeName {
-			// Create worktree from existing branch
+		if sourceBranch != "" {
+			fmt.Printf("Creating worktree '%s' from branch '%s'...\n", worktreeName, sourceBranch)
 			err = createWorktreeFromBranch(repoPath, worktreeName, sourceBranch, config)
 		} else {
-			// Create new branch with worktree
+			fmt.Printf("Creating worktree '%s'...\n", worktreeName)
 			err = createWorktree(repoPath, worktreeName, config)
 		}
 

@@ -11,7 +11,11 @@ import (
 func runGit(t *testing.T, repoPath string, args ...string) []byte {
 	t.Helper()
 
-	cmd := exec.Command("git", args...)
+	gitArgs := append([]string{
+		"-c", "commit.gpgsign=false",
+		"-c", "tag.gpgsign=false",
+	}, args...)
+	cmd := exec.Command("git", gitArgs...)
 	cmd.Dir = repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -25,7 +29,7 @@ func initRepo(t *testing.T) string {
 	t.Helper()
 
 	repoPath := t.TempDir()
-	runGit(t, repoPath, "init")
+	runGit(t, repoPath, "init", "--initial-branch=master")
 
 	readmePath := filepath.Join(repoPath, "README.md")
 	if err := os.WriteFile(readmePath, []byte("test"), 0644); err != nil {

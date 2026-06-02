@@ -61,6 +61,72 @@ func TestGTRunCreatesWorktreeAndUpdatesExcludes(t *testing.T) {
 	}
 }
 
+func TestGTRunCreatesWorktreeFromRemoteBranch(t *testing.T) {
+	seedPath := initRepo(t)
+	binaryPath := buildBinary(t)
+
+	// Seed a bare origin with only the default branch.
+	remotePath := filepath.Join(t.TempDir(), "origin.git")
+	defaultBranch := strings.TrimSpace(string(runGit(t, seedPath, "rev-parse", "--abbrev-ref", "HEAD")))
+	runGit(t, seedPath, "init", "--bare", remotePath)
+	runGit(t, seedPath, "remote", "add", "origin", remotePath)
+	runGit(t, seedPath, "push", "-u", "origin", defaultBranch)
+	runGit(t, remotePath, "symbolic-ref", "HEAD", "refs/heads/"+defaultBranch)
+
+	// This is the repo where the user will run gt. It is cloned before the
+	// remote-only branch exists, so it cannot already know about that branch.
+	targetParent := t.TempDir()
+	targetPath := filepath.Join(targetParent, "target")
+	runGit(t, targetParent, "clone", remotePath, targetPath)
+
+	// Simulate someone else creating and pushing the branch on the remote.
+	publisherParent := t.TempDir()
+	publisherPath := filepath.Join(publisherParent, "publisher")
+	runGit(t, publisherParent, "clone", remotePath, publisherPath)
+	runGit(t, publisherPath, "checkout", "-b", "remote-feature")
+	remoteFile := filepath.Join(publisherPath, "remote.txt")
+	if err := os.WriteFile(remoteFile, []byte("from remote"), 0644); err != nil {
+		t.Fatalf("write remote file: %v", err)
+	}
+	runGit(t, publisherPath, "add", "remote.txt")
+	runGit(t, publisherPath, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+		"commit", "-m", "remote feature")
+	runGit(t, publisherPath, "push", "origin", "remote-feature")
+
+	// Prove the target clone has neither a local branch nor a remote-tracking
+	// branch before gt runs. gt must discover and fetch the remote branch.
+	localBranch := strings.TrimSpace(string(runGit(t, targetPath, "branch", "--list", "remote-feature")))
+	if localBranch != "" {
+		t.Fatalf("target clone unexpectedly has local branch: %q", localBranch)
+	}
+	remoteTrackingBranch := strings.TrimSpace(string(runGit(t, targetPath, "branch", "-r", "--list", "origin/remote-feature")))
+	if remoteTrackingBranch != "" {
+		t.Fatalf("target clone unexpectedly has remote-tracking branch: %q", remoteTrackingBranch)
+	}
+
+	// Running gt with just the branch name should create a worktree from the
+	// remote branch, not create a new same-named branch from the current HEAD.
+	cmd := exec.Command(binaryPath, "-x", "true", "remote-feature")
+	cmd.Dir = targetPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gt run failed: %v\n%s", err, output)
+	}
+
+	worktreePath := filepath.Join(targetPath, defaultWorktreeDir, "remote-feature")
+	if _, err := os.Stat(filepath.Join(worktreePath, "remote.txt")); err != nil {
+		t.Fatalf("expected worktree to contain remote branch file: %v", err)
+	}
+
+	// The local branch should track the remote branch, matching git switch's
+	// remote-guess behavior.
+	upstream := strings.TrimSpace(string(runGit(t, targetPath,
+		"rev-parse", "--abbrev-ref", "--symbolic-full-name", "remote-feature@{upstream}")))
+	if upstream != "origin/remote-feature" {
+		t.Fatalf("upstream = %q, want origin/remote-feature", upstream)
+	}
+}
+
 func TestGTCreateWorktreeFromSourceBranch(t *testing.T) {
 	repoPath := initRepo(t)
 	binaryPath := buildBinary(t)

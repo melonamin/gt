@@ -89,7 +89,7 @@ $ gt
 ```bash
 # In any git repository
 gt                    # Open interactive worktree manager
-gt feature-xyz        # Create worktree 'feature-xyz' from current branch and switch
+gt feature-xyz        # Reuse/create branch 'feature-xyz' and switch
 gt fix-bug main       # Create worktree 'fix-bug' from 'main' branch and switch
 ```
 
@@ -101,7 +101,7 @@ That's it. No configuration needed.
 ```bash
 gt my-feature
 ```
-Creates a new worktree from your current branch and switches to it immediately. Your original working directory stays untouched.
+Creates a worktree for `my-feature` and switches to it immediately. If `my-feature` already exists locally, that branch is reused. If a matching remote-tracking branch exists, or a matching remote branch can be discovered on exactly one remote or on the remote named by `checkout.defaultRemote`, `gt` creates a local tracking branch and uses that. Unfetched remote branches are fetched before creating the local branch. If no local or remote branch matches, `gt` creates a new branch from your current `HEAD`. Your original working directory stays untouched.
 
 ### 🎯 Interactive Management
 ```bash
@@ -142,10 +142,21 @@ my-project/
 ### Command Line
 ```bash
 gt                           # Open interactive worktree manager
-gt <name>                    # Create worktree from current branch and switch
+gt <name>                    # Reuse local/remote branch, or create from current HEAD
 gt <name> <branch>           # Create worktree from specified branch and switch
 gt -h, --help                # Show help
 ```
+
+### Branch Selection
+
+`gt <name>` follows the same remote-guessing behavior as `git switch <name>`:
+- If a local branch named `<name>` exists, `gt` creates a worktree for that branch.
+- If no local branch exists and a matching remote-tracking branch exists, or a matching branch is discovered on exactly one remote, `gt` creates a local branch tracking that remote branch and creates the worktree.
+- If the branch is discovered on the remote but has not been fetched yet, `gt` fetches that branch first.
+- If multiple remotes have the branch, set `checkout.defaultRemote` to choose one.
+- If no local or remote branch matches, `gt` creates a new branch from the current `HEAD`.
+
+`gt <name> <branch>` is explicit: it creates a new branch named `<name>` from `<branch>`.
 
 ### Interactive Mode (TUI)
 
