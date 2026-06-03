@@ -1408,6 +1408,9 @@ type remoteBranchMatch struct {
 	needsFetch bool
 }
 
+// getCheckoutDefaultRemote returns the value of the `checkout.defaultRemote`
+// git config option, or "" if unset. A read error is treated as "unset" so
+// callers fall back to the multi-remote ambiguity check.
 func getCheckoutDefaultRemote(repoPath string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
 	defer cancel()
@@ -1418,6 +1421,8 @@ func getCheckoutDefaultRemote(repoPath string) string {
 	return strings.TrimSpace(string(output))
 }
 
+// listRemotes returns the configured remote names. A read error is treated
+// as "no remotes" so callers skip remote discovery and create a fresh branch.
 func listRemotes(repoPath string) []string {
 	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
 	defer cancel()
@@ -1459,6 +1464,10 @@ func fetchRemoteBranch(repoPath, remote, branch string) error {
 	return nil
 }
 
+// resolveRemoteBranchForSwitch implements the same remote-guessing behavior as
+// `git switch <name>` (a.k.a. --guess-remote): when `checkout.defaultRemote` is
+// set and the branch exists on that remote, that one wins; otherwise the branch
+// must exist on exactly one remote. Anything ambiguous returns an error.
 func resolveRemoteBranchForSwitch(repoPath, branch string) (*remoteBranchMatch, error) {
 	remotes := listRemotes(repoPath)
 	if len(remotes) == 0 {
@@ -1599,26 +1608,33 @@ func createWorktree(repoPath, branch string, config *Config) error {
 	var (
 		args        []string
 		localExists = localBranchExists(repoPath, branch)
+		remoteMatch *remoteBranchMatch
 	)
 
 	switch {
 	case localExists:
 		args = []string{"worktree", "add", worktreePath, branch}
 	default:
-		remoteMatch, err := resolveRemoteBranchForSwitch(repoPath, branch)
+		match, err := resolveRemoteBranchForSwitch(repoPath, branch)
 		if err != nil {
 			return err
 		}
+		remoteMatch = match
 		if remoteMatch != nil {
 			if remoteMatch.needsFetch {
 				if err := fetchRemoteBranch(repoPath, remoteMatch.remote, branch); err != nil {
 					return err
 				}
 			}
-			if !refExists(repoPath, fmt.Sprintf("refs/remotes/%s/%s", remoteMatch.remote, branch)) {
+			fullRef := fmt.Sprintf("refs/remotes/%s/%s", remoteMatch.remote, branch)
+			if !refExists(repoPath, fullRef) {
 				return fmt.Errorf("failed to resolve remote branch %s", remoteMatch.ref)
 			}
-			args = []string{"worktree", "add", "--track", "-b", branch, worktreePath, remoteMatch.ref}
+			// Use --no-track and set upstream explicitly afterwards. `--track`
+			// rejects start points that aren't covered by the remote's
+			// configured fetch refspec (e.g. single-branch clones), which would
+			// fail even though we just fetched the ref.
+			args = []string{"worktree", "add", "--no-track", "-b", branch, worktreePath, fullRef}
 		} else {
 			args = []string{"worktree", "add", "-b", branch, worktreePath}
 		}
@@ -1627,6 +1643,22 @@ func createWorktree(repoPath, branch string, config *Config) error {
 	output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 	if err != nil {
 		return fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
+	}
+
+	// Point the new branch's upstream at the remote branch we used. Done by
+	// writing config directly (not via `branch --set-upstream-to`) so it works
+	// in single-branch / restricted-refspec clones, where git refuses to track
+	// a ref outside the configured fetch refspec.
+	if remoteMatch != nil {
+		remoteKey := fmt.Sprintf("branch.%s.remote", branch)
+		mergeKey := fmt.Sprintf("branch.%s.merge", branch)
+		mergeRef := fmt.Sprintf("refs/heads/%s", branch)
+		if out, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "config", remoteKey, remoteMatch.remote); err != nil {
+			return fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
+		}
+		if out, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "config", mergeKey, mergeRef); err != nil {
+			return fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
+		}
 	}
 
 	return nil

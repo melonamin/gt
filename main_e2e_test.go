@@ -127,6 +127,192 @@ func TestGTRunCreatesWorktreeFromRemoteBranch(t *testing.T) {
 	}
 }
 
+// publishBranch creates `branchName` in publisher, commits a file, and pushes
+// it to every remote configured in publisher.
+func publishBranch(t *testing.T, publisherPath, branchName, fileName, fileContents string, remotes ...string) {
+	t.Helper()
+	runGit(t, publisherPath, "checkout", "-b", branchName)
+	if err := os.WriteFile(filepath.Join(publisherPath, fileName), []byte(fileContents), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	runGit(t, publisherPath, "add", fileName)
+	runGit(t, publisherPath, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+		"commit", "-m", "publish "+branchName)
+	for _, remote := range remotes {
+		runGit(t, publisherPath, "push", remote, branchName)
+	}
+	runGit(t, publisherPath, "checkout", "master")
+}
+
+// initBareWithSeed sets up a bare origin populated by `seedPath` and returns the
+// bare repo path with HEAD pointing at the default branch.
+func initBareWithSeed(t *testing.T, seedPath string) string {
+	t.Helper()
+	remotePath := filepath.Join(t.TempDir(), "origin.git")
+	defaultBranch := strings.TrimSpace(string(runGit(t, seedPath, "rev-parse", "--abbrev-ref", "HEAD")))
+	runGit(t, seedPath, "init", "--bare", remotePath)
+	runGit(t, seedPath, "remote", "add", "origin", remotePath)
+	runGit(t, seedPath, "push", "-u", "origin", defaultBranch)
+	runGit(t, remotePath, "symbolic-ref", "HEAD", "refs/heads/"+defaultBranch)
+	return remotePath
+}
+
+// TestGTRunSingleBranchCloneFetchesRemoteBranch verifies the case that broke
+// before: a single-branch clone whose configured fetch refspec does not cover
+// the requested branch. gt must explicitly fetch the branch and set up
+// upstream config directly, bypassing git's refspec-aware tracking checks.
+func TestGTRunSingleBranchCloneFetchesRemoteBranch(t *testing.T) {
+	seedPath := initRepo(t)
+	binaryPath := buildBinary(t)
+	remotePath := initBareWithSeed(t, seedPath)
+
+	publisherParent := t.TempDir()
+	publisherPath := filepath.Join(publisherParent, "publisher")
+	runGit(t, publisherParent, "clone", remotePath, publisherPath)
+	publishBranch(t, publisherPath, "remote-feature", "remote.txt", "from remote", "origin")
+
+	// Single-branch clone restricts remote.origin.fetch to master only.
+	targetParent := t.TempDir()
+	targetPath := filepath.Join(targetParent, "target")
+	runGit(t, targetParent, "clone", "--single-branch", "-b", "master", remotePath, targetPath)
+
+	fetchSpec := strings.TrimSpace(string(runGit(t, targetPath, "config", "--get-all", "remote.origin.fetch")))
+	if strings.Contains(fetchSpec, "remote-feature") || strings.Contains(fetchSpec, "*") {
+		t.Fatalf("expected restricted fetch refspec, got %q", fetchSpec)
+	}
+
+	cmd := exec.Command(binaryPath, "-x", "true", "remote-feature")
+	cmd.Dir = targetPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gt run failed: %v\n%s", err, output)
+	}
+
+	worktreePath := filepath.Join(targetPath, defaultWorktreeDir, "remote-feature")
+	if _, err := os.Stat(filepath.Join(worktreePath, "remote.txt")); err != nil {
+		t.Fatalf("expected worktree to contain remote branch file: %v", err)
+	}
+
+	// `@{upstream}` rejects refs outside the configured refspec in single-branch
+	// clones, even when the underlying config is valid. Check the config keys
+	// directly, which is what gt writes and what `git pull` consults.
+	remote := strings.TrimSpace(string(runGit(t, targetPath, "config", "--get", "branch.remote-feature.remote")))
+	merge := strings.TrimSpace(string(runGit(t, targetPath, "config", "--get", "branch.remote-feature.merge")))
+	if remote != "origin" || merge != "refs/heads/remote-feature" {
+		t.Fatalf("upstream config = (%q, %q), want (origin, refs/heads/remote-feature)", remote, merge)
+	}
+}
+
+// TestGTRunMultiRemoteConflictErrors verifies that when the same branch lives
+// on multiple remotes and no checkout.defaultRemote is set, gt refuses to
+// guess and returns a helpful error.
+func TestGTRunMultiRemoteConflictErrors(t *testing.T) {
+	seedPath := initRepo(t)
+	binaryPath := buildBinary(t)
+	remoteAPath := initBareWithSeed(t, seedPath)
+	remoteBPath := filepath.Join(t.TempDir(), "originB.git")
+	runGit(t, seedPath, "init", "--bare", remoteBPath)
+	runGit(t, seedPath, "remote", "add", "originB", remoteBPath)
+	runGit(t, seedPath, "push", "originB", "master")
+
+	publisherParent := t.TempDir()
+	publisherPath := filepath.Join(publisherParent, "publisher")
+	runGit(t, publisherParent, "clone", remoteAPath, publisherPath)
+	runGit(t, publisherPath, "remote", "add", "originB", remoteBPath)
+	publishBranch(t, publisherPath, "shared", "shared.txt", "x", "origin", "originB")
+
+	targetParent := t.TempDir()
+	targetPath := filepath.Join(targetParent, "target")
+	runGit(t, targetParent, "clone", remoteAPath, targetPath)
+	runGit(t, targetPath, "remote", "add", "originB", remoteBPath)
+	runGit(t, targetPath, "fetch", "originB")
+
+	cmd := exec.Command(binaryPath, "-x", "true", "shared")
+	cmd.Dir = targetPath
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected gt to error on multi-remote ambiguity, got success:\n%s", output)
+	}
+	if !strings.Contains(string(output), "multiple remotes") {
+		t.Fatalf("expected multi-remote error message, got:\n%s", output)
+	}
+}
+
+// TestGTRunDefaultRemoteWins verifies that checkout.defaultRemote disambiguates
+// when the same branch lives on multiple remotes.
+func TestGTRunDefaultRemoteWins(t *testing.T) {
+	seedPath := initRepo(t)
+	binaryPath := buildBinary(t)
+	remoteAPath := initBareWithSeed(t, seedPath)
+	remoteBPath := filepath.Join(t.TempDir(), "originB.git")
+	runGit(t, seedPath, "init", "--bare", remoteBPath)
+	runGit(t, seedPath, "remote", "add", "originB", remoteBPath)
+	runGit(t, seedPath, "push", "originB", "master")
+
+	publisherParent := t.TempDir()
+	publisherPath := filepath.Join(publisherParent, "publisher")
+	runGit(t, publisherParent, "clone", remoteAPath, publisherPath)
+	runGit(t, publisherPath, "remote", "add", "originB", remoteBPath)
+	publishBranch(t, publisherPath, "shared", "shared.txt", "x", "origin", "originB")
+
+	targetParent := t.TempDir()
+	targetPath := filepath.Join(targetParent, "target")
+	runGit(t, targetParent, "clone", remoteAPath, targetPath)
+	runGit(t, targetPath, "remote", "add", "originB", remoteBPath)
+	runGit(t, targetPath, "fetch", "originB")
+	runGit(t, targetPath, "config", "checkout.defaultRemote", "originB")
+
+	cmd := exec.Command(binaryPath, "-x", "true", "shared")
+	cmd.Dir = targetPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gt run failed: %v\n%s", err, output)
+	}
+
+	remote := strings.TrimSpace(string(runGit(t, targetPath, "config", "--get", "branch.shared.remote")))
+	if remote != "originB" {
+		t.Fatalf("branch.shared.remote = %q, want originB", remote)
+	}
+}
+
+// TestGTRunDefaultRemoteFallthrough verifies that when checkout.defaultRemote
+// is set but the branch is not on that remote, gt still finds the branch on
+// the other remote where it actually exists.
+func TestGTRunDefaultRemoteFallthrough(t *testing.T) {
+	seedPath := initRepo(t)
+	binaryPath := buildBinary(t)
+	remoteAPath := initBareWithSeed(t, seedPath)
+	remoteBPath := filepath.Join(t.TempDir(), "originB.git")
+	runGit(t, seedPath, "init", "--bare", remoteBPath)
+	runGit(t, seedPath, "remote", "add", "originB", remoteBPath)
+	runGit(t, seedPath, "push", "originB", "master")
+
+	publisherParent := t.TempDir()
+	publisherPath := filepath.Join(publisherParent, "publisher")
+	runGit(t, publisherParent, "clone", remoteAPath, publisherPath)
+	runGit(t, publisherPath, "remote", "add", "originB", remoteBPath)
+	publishBranch(t, publisherPath, "b-only", "b.txt", "x", "originB")
+
+	targetParent := t.TempDir()
+	targetPath := filepath.Join(targetParent, "target")
+	runGit(t, targetParent, "clone", remoteAPath, targetPath)
+	runGit(t, targetPath, "remote", "add", "originB", remoteBPath)
+	runGit(t, targetPath, "fetch", "originB")
+	runGit(t, targetPath, "config", "checkout.defaultRemote", "origin")
+
+	cmd := exec.Command(binaryPath, "-x", "true", "b-only")
+	cmd.Dir = targetPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gt run failed: %v\n%s", err, output)
+	}
+
+	remote := strings.TrimSpace(string(runGit(t, targetPath, "config", "--get", "branch.b-only.remote")))
+	if remote != "originB" {
+		t.Fatalf("branch.b-only.remote = %q, want originB (fallthrough)", remote)
+	}
+}
+
 func TestGTCreateWorktreeFromSourceBranch(t *testing.T) {
 	repoPath := initRepo(t)
 	binaryPath := buildBinary(t)
