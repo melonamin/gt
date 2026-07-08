@@ -61,6 +61,51 @@ func TestGTRunCreatesWorktreeAndUpdatesExcludes(t *testing.T) {
 	}
 }
 
+func TestGTRunFromLinkedWorktreeUsesMainRelativeWorktreeDir(t *testing.T) {
+	repoPath := initRepo(t)
+	binaryPath := buildBinary(t)
+	configHome := t.TempDir()
+
+	runGT := func(dir string, args ...string) []byte {
+		t.Helper()
+		cmd := exec.Command(binaryPath, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("gt %v failed from %s: %v\n%s", args, dir, err, output)
+		}
+		return output
+	}
+
+	runGT(repoPath, "-x", "true", "feature-one")
+
+	firstWorktreePath := filepath.Join(repoPath, defaultWorktreeDir, "feature-one")
+	featureFile := filepath.Join(firstWorktreePath, "from-feature-one.txt")
+	if err := os.WriteFile(featureFile, []byte("created on feature one"), 0644); err != nil {
+		t.Fatalf("write feature file: %v", err)
+	}
+	runGit(t, firstWorktreePath, "add", "from-feature-one.txt")
+	runGit(t, firstWorktreePath, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+		"commit", "-m", "feature one commit")
+
+	runGT(firstWorktreePath, "-x", "true", "feature-two")
+
+	flatWorktreePath := filepath.Join(repoPath, defaultWorktreeDir, "feature-two")
+	if _, err := os.Stat(flatWorktreePath); err != nil {
+		t.Fatalf("expected worktree at main worktree-relative path: %v", err)
+	}
+
+	nestedWorktreePath := filepath.Join(firstWorktreePath, defaultWorktreeDir, "feature-two")
+	if _, err := os.Stat(nestedWorktreePath); err == nil {
+		t.Fatalf("did not expect nested worktree at %s", nestedWorktreePath)
+	}
+
+	if _, err := os.Stat(filepath.Join(flatWorktreePath, "from-feature-one.txt")); err != nil {
+		t.Fatalf("expected new worktree to branch from linked worktree HEAD: %v", err)
+	}
+}
+
 func TestGTRunCreatesWorktreeFromRemoteBranch(t *testing.T) {
 	seedPath := initRepo(t)
 	binaryPath := buildBinary(t)

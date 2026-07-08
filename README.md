@@ -192,10 +192,15 @@ Configuration file: `~/.config/gt/config.json`
 
 ```json
 {
-  "worktree_dir": ".worktrees",  // Where to store worktrees (relative or absolute)
+  "worktree_dir": ".worktrees",  // Worktree storage path (relative or absolute)
   "shell": "fish"                 // Override shell (default: $SHELL)
 }
 ```
+
+Relative `worktree_dir` values are resolved from the main worktree in normal
+non-bare repositories with a real `.git/` directory. If `gt` cannot identify
+that typical layout, it falls back to resolving them from the current Git
+top-level directory.
 
 ### Environment Variables
 
@@ -235,7 +240,7 @@ Git worktrees let you have multiple working directories for the same repository.
 A: `gt` is to `git worktree` what `tig` is to `git log`. It makes the powerful feature actually pleasant to use.
 
 **Q: Where are my worktrees stored?**
-A: By default in `.worktrees/` within your repo. This is configurable and automatically added to `.git/info/exclude`.
+A: By default in `.worktrees/` within your main worktree. This is configurable and automatically added to `.git/info/exclude` when the directory is inside the repo.
 
 **Q: Can I use my existing worktrees?**
 A: Yes! `gt` shows all worktrees, regardless of where they were created.
