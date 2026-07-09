@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +19,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/cli/go-gh/v2/pkg/auth"
 )
 
 const (
@@ -42,6 +46,10 @@ const (
 	maxDetailFetchWorkers = 4
 	worktreeDetailTimeout = 30 * time.Second
 	worktreeCmdTimeout    = 2 * time.Minute
+	githubPRBackoff       = 5 * time.Minute
+	githubPRBatchSize     = 25
+	githubGraphQLEndpoint = "https://api.github.com/graphql"
+	pullRequestSymbol     = "⎇"
 )
 
 // Config holds user configuration loaded from ~/.config/gt/config.json.
@@ -80,6 +88,7 @@ type Worktree struct {
 	IsCurrent  bool
 	Ahead      int
 	Behind     int
+	PRState    pullRequestState
 }
 
 // CommitInfo holds metadata about a git commit.
@@ -88,6 +97,37 @@ type CommitInfo struct {
 	Message string
 	Date    time.Time
 	Author  string
+}
+
+type pullRequestState string
+
+const (
+	pullRequestStateNone   pullRequestState = ""
+	pullRequestStateOpen   pullRequestState = "open"
+	pullRequestStateClosed pullRequestState = "closed"
+	pullRequestStateMerged pullRequestState = "merged"
+)
+
+type gitRemote struct {
+	Name string
+	URL  string
+}
+
+type githubRepo struct {
+	Owner string
+	Name  string
+}
+
+type pullRequestLookup struct {
+	Branch     string
+	Head       string
+	HeadOwners map[string]bool
+}
+
+type tokenLookupFunc func(host string) (token, source string)
+
+func defaultTokenLookup(host string) (string, string) {
+	return auth.TokenForHost(host)
 }
 
 // inputMode represents the current input state of the TUI.
@@ -137,6 +177,8 @@ type worktreeState struct {
 	detailQueue         []int
 	activeDetailFetches int
 	detailGeneration    int
+	prGeneration        int
+	prBackoffUntil      time.Time
 }
 
 // actionsState holds the state for the actions menu.
@@ -219,6 +261,15 @@ var (
 
 	behindStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("214"))
+
+	pullRequestOpenStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("82"))
+
+	pullRequestClosedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("196"))
+
+	pullRequestMergedStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("141"))
 )
 
 // printInfo prints a dimmed informational message to stdout.
@@ -311,6 +362,119 @@ func isExpectedWorktreePath(branch, worktreePath string) bool {
 	expectedName := strings.ReplaceAll(branch, "/", "-")
 	actualName := filepath.Base(filepath.Clean(worktreePath))
 	return actualName == expectedName
+}
+
+func normalizeGitHubRepoName(repo string) string {
+	return strings.TrimSuffix(strings.TrimSpace(repo), ".git")
+}
+
+func parseGitHubRemoteURL(remoteURL string) (githubRepo, bool) {
+	remoteURL = strings.TrimSpace(remoteURL)
+	if remoteURL == "" {
+		return githubRepo{}, false
+	}
+
+	parsePath := func(path string) (githubRepo, bool) {
+		path = strings.Trim(path, "/")
+		parts := strings.Split(path, "/")
+		if len(parts) < 2 {
+			return githubRepo{}, false
+		}
+		owner := strings.TrimSpace(parts[0])
+		name := normalizeGitHubRepoName(parts[1])
+		if owner == "" || name == "" {
+			return githubRepo{}, false
+		}
+		return githubRepo{Owner: owner, Name: name}, true
+	}
+
+	if u, err := url.Parse(remoteURL); err == nil && u.Scheme != "" {
+		if strings.EqualFold(u.Hostname(), "github.com") {
+			return parsePath(u.Path)
+		}
+		return githubRepo{}, false
+	}
+
+	if strings.HasPrefix(remoteURL, "git@github.com:") {
+		return parsePath(strings.TrimPrefix(remoteURL, "git@github.com:"))
+	}
+
+	return githubRepo{}, false
+}
+
+func chooseBaseGitHubRepo(remotes []gitRemote) (githubRepo, bool) {
+	for _, preferred := range []string{"upstream", "origin"} {
+		for _, remote := range remotes {
+			if remote.Name != preferred {
+				continue
+			}
+			if repo, ok := parseGitHubRemoteURL(remote.URL); ok {
+				return repo, true
+			}
+		}
+	}
+
+	for _, remote := range remotes {
+		if repo, ok := parseGitHubRemoteURL(remote.URL); ok {
+			return repo, true
+		}
+	}
+
+	return githubRepo{}, false
+}
+
+func githubRemoteOwners(remotes []gitRemote, baseRepo githubRepo) map[string]bool {
+	owners := make(map[string]bool)
+	if baseRepo.Owner != "" {
+		owners[strings.ToLower(baseRepo.Owner)] = true
+	}
+	for _, remote := range remotes {
+		repo, ok := parseGitHubRemoteURL(remote.URL)
+		if ok && repo.Owner != "" {
+			owners[strings.ToLower(repo.Owner)] = true
+		}
+	}
+	return owners
+}
+
+func pullRequestStateFromGitHub(state string) pullRequestState {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "OPEN":
+		return pullRequestStateOpen
+	case "CLOSED":
+		return pullRequestStateClosed
+	case "MERGED":
+		return pullRequestStateMerged
+	default:
+		return pullRequestStateNone
+	}
+}
+
+func pullRequestStateSymbol(state pullRequestState) string {
+	if state == pullRequestStateNone {
+		return " "
+	}
+	return pullRequestSymbol
+}
+
+func renderPullRequestMarker(state pullRequestState) string {
+	switch state {
+	case pullRequestStateOpen:
+		return pullRequestOpenStyle.Render(pullRequestSymbol)
+	case pullRequestStateClosed:
+		return pullRequestClosedStyle.Render(pullRequestSymbol)
+	case pullRequestStateMerged:
+		return pullRequestMergedStyle.Render(pullRequestSymbol)
+	default:
+		return " "
+	}
+}
+
+func nextPullRequestBackoff(now time.Time, err error) time.Time {
+	if err == nil {
+		return time.Time{}
+	}
+	return now.Add(githubPRBackoff)
 }
 
 func getConfigPath() string {
@@ -852,6 +1016,12 @@ type worktreeDetailLoadedMsg struct {
 	generation int
 }
 
+type pullRequestsLoadedMsg struct {
+	states     map[string]pullRequestState
+	generation int
+	err        error
+}
+
 func fetchWorktreeDetailCmd(wt Worktree, index int, defaultBranch string, generation int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), worktreeDetailTimeout)
@@ -860,6 +1030,19 @@ func fetchWorktreeDetailCmd(wt Worktree, index int, defaultBranch string, genera
 		return worktreeDetailLoadedMsg{
 			detail:     detail,
 			generation: generation,
+		}
+	}
+}
+
+func fetchPullRequestsCmd(repoPath string, worktrees []Worktree, generation int) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
+		defer cancel()
+		states, err := loadPullRequestStates(ctx, repoPath, worktrees, defaultTokenLookup, http.DefaultClient)
+		return pullRequestsLoadedMsg{
+			states:     states,
+			generation: generation,
+			err:        err,
 		}
 	}
 }
@@ -957,6 +1140,25 @@ func (m *model) startDetailFetches() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+func (m *model) startPullRequestFetch() tea.Cmd {
+	if time.Now().Before(m.wt.prBackoffUntil) {
+		return nil
+	}
+	worktrees := make([]Worktree, 0, len(m.wt.worktrees))
+	for _, wt := range m.wt.worktrees {
+		if wt.Branch != "" && wt.Head != "" {
+			worktrees = append(worktrees, Worktree{
+				Branch: wt.Branch,
+				Head:   wt.Head,
+			})
+		}
+	}
+	if len(worktrees) == 0 {
+		return nil
+	}
+	return fetchPullRequestsCmd(m.repoPath, worktrees, m.wt.prGeneration)
+}
+
 func (m *model) applyWorktreeDetail(detail worktreeDetails) {
 	if detail.index < 0 || detail.index >= len(m.wt.worktrees) {
 		return
@@ -970,6 +1172,18 @@ func (m *model) applyWorktreeDetail(detail worktreeDetails) {
 
 	// Rebuild filtered from worktrees to keep them in sync
 	// This is O(n) but simpler and more correct than manual sync
+	m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
+}
+
+func (m *model) applyPullRequestStates(states map[string]pullRequestState) {
+	if len(states) == 0 {
+		return
+	}
+	for i := range m.wt.worktrees {
+		if state, ok := states[m.wt.worktrees[i].Branch]; ok {
+			m.wt.worktrees[i].PRState = state
+		}
+	}
 	m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
 }
 
@@ -1350,6 +1564,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.wt.defaultBranch = msg.defaultBranch
 		m.mainWorktreeDir = msg.mainWorktreeDir
 		m.wt.detailGeneration++
+		m.wt.prGeneration++
 		m.resetDetailQueue()
 		// Find current worktree path for tracking previous (session-only)
 		if m.wt.previousWorktree == "" {
@@ -1360,10 +1575,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		cmds := []tea.Cmd{tickCmd()}
 		if detailCmd := m.startDetailFetches(); detailCmd != nil {
-			return m, tea.Batch(tickCmd(), detailCmd)
+			cmds = append(cmds, detailCmd)
 		}
-		return m, tickCmd()
+		if pullRequestCmd := m.startPullRequestFetch(); pullRequestCmd != nil {
+			cmds = append(cmds, pullRequestCmd)
+		}
+		return m, tea.Batch(cmds...)
 
 	case worktreeDetailLoadedMsg:
 		if msg.generation != m.wt.detailGeneration {
@@ -1376,6 +1595,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if detailCmd := m.startDetailFetches(); detailCmd != nil {
 			return m, tea.Batch(tickCmd(), detailCmd)
 		}
+		return m, tickCmd()
+
+	case pullRequestsLoadedMsg:
+		if msg.generation != m.wt.prGeneration {
+			return m, tickCmd()
+		}
+		if msg.err != nil {
+			m.wt.prBackoffUntil = nextPullRequestBackoff(time.Now(), msg.err)
+			return m, tickCmd()
+		}
+		m.wt.prBackoffUntil = time.Time{}
+		m.applyPullRequestStates(msg.states)
 		return m, tickCmd()
 
 	case worktreeCreatedMsg:
@@ -1564,6 +1795,213 @@ func listRemotes(repoPath string) []string {
 		return nil
 	}
 	return strings.Fields(string(output))
+}
+
+func listGitRemotesWithContext(ctx context.Context, repoPath string) ([]gitRemote, error) {
+	output, err := runGitCmd(ctx, repoPath, "config", "--get-regexp", `^remote\..*\.url$`)
+	if err != nil {
+		return nil, err
+	}
+
+	var remotes []gitRemote
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		key := fields[0]
+		if !strings.HasPrefix(key, "remote.") || !strings.HasSuffix(key, ".url") {
+			continue
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(key, "remote."), ".url")
+		if name == "" {
+			continue
+		}
+		remotes = append(remotes, gitRemote{
+			Name: name,
+			URL:  fields[1],
+		})
+	}
+	return remotes, nil
+}
+
+type githubPullRequestNode struct {
+	State               string `json:"state"`
+	HeadRefOID          string `json:"headRefOid"`
+	HeadRepositoryOwner struct {
+		Login string `json:"login"`
+	} `json:"headRepositoryOwner"`
+}
+
+type githubPullRequestConnection struct {
+	Nodes []githubPullRequestNode `json:"nodes"`
+}
+
+type githubPullRequestGraphQLResponse struct {
+	Data struct {
+		Repository map[string]githubPullRequestConnection `json:"repository"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+func githubPullRequestAlias(index int) string {
+	return fmt.Sprintf("pr%d", index)
+}
+
+func pullRequestNodeMatchesLookup(node githubPullRequestNode, lookup pullRequestLookup) bool {
+	if lookup.Head != "" && !strings.EqualFold(node.HeadRefOID, lookup.Head) {
+		return false
+	}
+	if len(lookup.HeadOwners) == 0 {
+		return true
+	}
+	owner := strings.ToLower(strings.TrimSpace(node.HeadRepositoryOwner.Login))
+	return owner != "" && lookup.HeadOwners[owner]
+}
+
+func mapPullRequestStates(lookups []pullRequestLookup, response githubPullRequestGraphQLResponse) map[string]pullRequestState {
+	states := make(map[string]pullRequestState)
+	for i, lookup := range lookups {
+		if lookup.Branch == "" {
+			continue
+		}
+		conn, ok := response.Data.Repository[githubPullRequestAlias(i)]
+		if !ok || len(conn.Nodes) == 0 {
+			continue
+		}
+		for _, node := range conn.Nodes {
+			if !pullRequestNodeMatchesLookup(node, lookup) {
+				continue
+			}
+			if state := pullRequestStateFromGitHub(node.State); state != pullRequestStateNone {
+				states[lookup.Branch] = state
+				break
+			}
+		}
+	}
+	return states
+}
+
+func uniquePullRequestLookups(worktrees []Worktree, headOwners map[string]bool) []pullRequestLookup {
+	seen := make(map[string]bool)
+	unique := make([]pullRequestLookup, 0, len(worktrees))
+	for _, wt := range worktrees {
+		branch := strings.TrimSpace(wt.Branch)
+		head := strings.TrimSpace(wt.Head)
+		key := branch + "\x00" + strings.ToLower(head)
+		if branch == "" || head == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		unique = append(unique, pullRequestLookup{
+			Branch:     branch,
+			Head:       head,
+			HeadOwners: headOwners,
+		})
+	}
+	return unique
+}
+
+func buildPullRequestGraphQLQuery(repo githubRepo, lookups []pullRequestLookup) string {
+	var b strings.Builder
+	b.WriteString("query {\n")
+	b.WriteString(fmt.Sprintf("  repository(owner: %s, name: %s) {\n", strconv.Quote(repo.Owner), strconv.Quote(repo.Name)))
+	for i, lookup := range lookups {
+		b.WriteString(fmt.Sprintf(
+			"    %s: pullRequests(first: 10, headRefName: %s, states: [OPEN, CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { state headRefOid headRepositoryOwner { login } } }\n",
+			githubPullRequestAlias(i),
+			strconv.Quote(lookup.Branch),
+		))
+	}
+	b.WriteString("  }\n")
+	b.WriteString("}\n")
+	return b.String()
+}
+
+func fetchPullRequestStates(ctx context.Context, client *http.Client, endpoint, token string, repo githubRepo, lookups []pullRequestLookup) (map[string]pullRequestState, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	states := make(map[string]pullRequestState)
+	if len(lookups) == 0 {
+		return states, nil
+	}
+
+	for start := 0; start < len(lookups); start += githubPRBatchSize {
+		end := start + githubPRBatchSize
+		if end > len(lookups) {
+			end = len(lookups)
+		}
+		batch := lookups[start:end]
+		body, err := json.Marshal(map[string]string{
+			"query": buildPullRequestGraphQLQuery(repo, batch),
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				err = fmt.Errorf("github graphql returned status %d", resp.StatusCode)
+				return
+			}
+
+			var graphQLResp githubPullRequestGraphQLResponse
+			if decodeErr := json.NewDecoder(resp.Body).Decode(&graphQLResp); decodeErr != nil {
+				err = decodeErr
+				return
+			}
+			if len(graphQLResp.Errors) > 0 {
+				err = fmt.Errorf("github graphql error: %s", graphQLResp.Errors[0].Message)
+				return
+			}
+			for branch, state := range mapPullRequestStates(batch, graphQLResp) {
+				states[branch] = state
+			}
+		}()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return states, nil
+}
+
+func loadPullRequestStates(ctx context.Context, repoPath string, worktrees []Worktree, tokenLookup tokenLookupFunc, client *http.Client) (map[string]pullRequestState, error) {
+	if tokenLookup == nil {
+		tokenLookup = defaultTokenLookup
+	}
+	token, _ := tokenLookup("github.com")
+	if token == "" {
+		return nil, errors.New("github token not found")
+	}
+
+	remotes, err := listGitRemotesWithContext(ctx, repoPath)
+	if err != nil {
+		return nil, err
+	}
+	repo, ok := chooseBaseGitHubRepo(remotes)
+	if !ok {
+		return map[string]pullRequestState{}, nil
+	}
+	lookups := uniquePullRequestLookups(worktrees, githubRemoteOwners(remotes, repo))
+
+	return fetchPullRequestStates(ctx, client, githubGraphQLEndpoint, token, repo, lookups)
 }
 
 func findRemoteBranch(repoPath, remote, branch string) (*remoteBranchMatch, bool) {
@@ -1984,12 +2422,17 @@ func (m model) View() string {
 
 		for i := m.ui.scrollOffset; i < len(m.wt.filtered) && i < m.ui.scrollOffset+viewportHeight; i++ {
 			wt := m.wt.filtered[i]
+			branchColumnWidth := branchDisplayWidth - 1
+			if branchColumnWidth < 1 {
+				branchColumnWidth = 1
+			}
 
 			// Cursor indicator
 			cursor := "  "
 			if i == m.ui.cursor {
 				cursor = "▸ "
 			}
+			pullRequestMarker := renderPullRequestMarker(wt.PRState)
 
 			// Branch name
 			branch := wt.Branch
@@ -2038,7 +2481,7 @@ func (m model) View() string {
 			folderLabel := ""
 			if hasFolderMismatch {
 				tail := fmt.Sprintf(" │ %s%s  ", status, aheadBehind)
-				basePrefix := fmt.Sprintf("%s%-*s", cursor, branchDisplayWidth, branch)
+				basePrefix := fmt.Sprintf("%s%s%-*s", cursor, pullRequestMarker, branchColumnWidth, branch)
 				basePrefixWidth := lipgloss.Width(basePrefix) + lipgloss.Width(tail)
 
 				fullLabel := " " + dimStyle.Render("[📂 "+folderName+"]")
@@ -2057,9 +2500,10 @@ func (m model) View() string {
 			} else {
 				separator = " "
 			}
-			prefix := fmt.Sprintf("%s%-*s%s%s%s%s ",
+			prefix := fmt.Sprintf("%s%s%-*s%s%s%s%s ",
 				cursor,
-				branchDisplayWidth,
+				pullRequestMarker,
+				branchColumnWidth,
 				branch,
 				folderLabel,
 				separator,
@@ -2263,6 +2707,9 @@ INTERACTIVE MODE COMMANDS:
     -        Jump to previous worktree
     @        Jump to current worktree
     q        Quit
+
+VISUAL STATUS:
+    ⎇        Lazygit-style GitHub PR status indicator (open, closed, or merged)
 
 QUICK ACTIONS (from actions menu):
     e        Open in editor ($EDITOR)

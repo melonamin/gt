@@ -135,6 +135,7 @@ my-project/
 - `●` Current worktree (where you are now)
 - `●` Dirty (uncommitted changes)
 - `✓` Clean
+- `⎇` Lazygit-style GitHub PR status indicator (open, closed, or merged)
 - Time-aware display (2 hours ago, 3 days ago, etc.)
 
 ## Usage

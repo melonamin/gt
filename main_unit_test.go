@@ -1,11 +1,23 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
 
 func TestEnsureGitExcludeEntryAddsEntry(t *testing.T) {
 	repoPath := initRepo(t)
@@ -148,6 +160,263 @@ func TestIsExpectedWorktreePath(t *testing.T) {
 				t.Errorf("isExpectedWorktreePath(%q, %q) = %v, want %v", tt.branch, tt.worktreePath, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseGitHubRemoteURL(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  githubRepo
+		ok    bool
+	}{
+		{"https", "https://github.com/melonamin/gt.git", githubRepo{Owner: "melonamin", Name: "gt"}, true},
+		{"ssh url", "ssh://git@github.com/melonamin/gt.git", githubRepo{Owner: "melonamin", Name: "gt"}, true},
+		{"scp ssh", "git@github.com:melonamin/gt.git", githubRepo{Owner: "melonamin", Name: "gt"}, true},
+		{"without git suffix", "https://github.com/melonamin/gt", githubRepo{Owner: "melonamin", Name: "gt"}, true},
+		{"enterprise out of scope", "https://github.example.com/melonamin/gt.git", githubRepo{}, false},
+		{"not github", "git@gitlab.com:melonamin/gt.git", githubRepo{}, false},
+		{"invalid", "not-a-url", githubRepo{}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseGitHubRemoteURL(tt.input)
+			if ok != tt.ok {
+				t.Fatalf("ok = %v, want %v", ok, tt.ok)
+			}
+			if got != tt.want {
+				t.Fatalf("repo = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestChooseBaseGitHubRepo(t *testing.T) {
+	tests := []struct {
+		name    string
+		remotes []gitRemote
+		want    githubRepo
+		ok      bool
+	}{
+		{
+			name: "upstream preferred over origin",
+			remotes: []gitRemote{
+				{Name: "origin", URL: "https://github.com/fishy/gt.git"},
+				{Name: "upstream", URL: "https://github.com/melonamin/gt.git"},
+			},
+			want: githubRepo{Owner: "melonamin", Name: "gt"},
+			ok:   true,
+		},
+		{
+			name: "origin preferred over other github remote",
+			remotes: []gitRemote{
+				{Name: "fork", URL: "https://github.com/fishy/gt.git"},
+				{Name: "origin", URL: "https://github.com/melonamin/gt.git"},
+			},
+			want: githubRepo{Owner: "melonamin", Name: "gt"},
+			ok:   true,
+		},
+		{
+			name: "first github remote fallback",
+			remotes: []gitRemote{
+				{Name: "mirror", URL: "https://gitlab.com/melonamin/gt.git"},
+				{Name: "fork", URL: "git@github.com:fishy/gt.git"},
+			},
+			want: githubRepo{Owner: "fishy", Name: "gt"},
+			ok:   true,
+		},
+		{
+			name: "no github remotes",
+			remotes: []gitRemote{
+				{Name: "origin", URL: "https://gitlab.com/melonamin/gt.git"},
+			},
+			want: githubRepo{},
+			ok:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := chooseBaseGitHubRepo(tt.remotes)
+			if ok != tt.ok {
+				t.Fatalf("ok = %v, want %v", ok, tt.ok)
+			}
+			if got != tt.want {
+				t.Fatalf("repo = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGitHubRemoteOwners(t *testing.T) {
+	got := githubRemoteOwners([]gitRemote{
+		{Name: "origin", URL: "git@github.com:fishy/gt.git"},
+		{Name: "upstream", URL: "https://github.com/melonamin/gt.git"},
+		{Name: "other", URL: "https://gitlab.com/example/gt.git"},
+	}, githubRepo{Owner: "melonamin", Name: "gt"})
+
+	for _, owner := range []string{"fishy", "melonamin"} {
+		if !got[owner] {
+			t.Fatalf("expected owner %q in %#v", owner, got)
+		}
+	}
+	if got["example"] {
+		t.Fatalf("did not expect non-GitHub owner in %#v", got)
+	}
+}
+
+func TestMapPullRequestStates(t *testing.T) {
+	var response githubPullRequestGraphQLResponse
+	response.Data.Repository = map[string]githubPullRequestConnection{
+		"pr0": {Nodes: []githubPullRequestNode{pullRequestNode("OPEN", "aaa", "fishy")}},
+		"pr1": {Nodes: []githubPullRequestNode{pullRequestNode("CLOSED", "bbb", "fishy")}},
+		"pr2": {Nodes: []githubPullRequestNode{pullRequestNode("MERGED", "ccc", "melonamin")}},
+		"pr3": {Nodes: nil},
+	}
+
+	got := mapPullRequestStates([]pullRequestLookup{
+		{Branch: "feature", Head: "aaa", HeadOwners: map[string]bool{"fishy": true}},
+		{Branch: "bugfix", Head: "bbb", HeadOwners: map[string]bool{"fishy": true}},
+		{Branch: "done", Head: "ccc", HeadOwners: map[string]bool{"melonamin": true}},
+		{Branch: "empty", Head: "ddd", HeadOwners: map[string]bool{"fishy": true}},
+	}, response)
+	want := map[string]pullRequestState{
+		"feature": pullRequestStateOpen,
+		"bugfix":  pullRequestStateClosed,
+		"done":    pullRequestStateMerged,
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("got %d states, want %d: %#v", len(got), len(want), got)
+	}
+	for branch, state := range want {
+		if got[branch] != state {
+			t.Fatalf("state for %s = %q, want %q", branch, got[branch], state)
+		}
+	}
+	if _, ok := got["empty"]; ok {
+		t.Fatalf("expected branch without PR nodes to be omitted")
+	}
+}
+
+func TestMapPullRequestStatesRequiresHeadAndOwnerMatch(t *testing.T) {
+	var response githubPullRequestGraphQLResponse
+	response.Data.Repository = map[string]githubPullRequestConnection{
+		"pr0": {Nodes: []githubPullRequestNode{
+			pullRequestNode("MERGED", "old-sha", "fishy"),
+			pullRequestNode("OPEN", "current-sha", "someone-else"),
+			pullRequestNode("OPEN", "current-sha", "fishy"),
+		}},
+		"pr1": {Nodes: []githubPullRequestNode{
+			pullRequestNode("CLOSED", "matching-sha", "someone-else"),
+		}},
+	}
+
+	got := mapPullRequestStates([]pullRequestLookup{
+		{Branch: "feature", Head: "current-sha", HeadOwners: map[string]bool{"fishy": true}},
+		{Branch: "other", Head: "matching-sha", HeadOwners: map[string]bool{"fishy": true}},
+	}, response)
+
+	if got["feature"] != pullRequestStateOpen {
+		t.Fatalf("feature state = %q, want %q", got["feature"], pullRequestStateOpen)
+	}
+	if _, ok := got["other"]; ok {
+		t.Fatalf("expected owner mismatch to be omitted")
+	}
+}
+
+func pullRequestNode(state, head, owner string) githubPullRequestNode {
+	var node githubPullRequestNode
+	node.State = state
+	node.HeadRefOID = head
+	node.HeadRepositoryOwner.Login = owner
+	return node
+}
+
+func TestBuildPullRequestGraphQLQueryIncludesHeadQualifiers(t *testing.T) {
+	query := buildPullRequestGraphQLQuery(githubRepo{Owner: "melonamin", Name: "gt"}, []pullRequestLookup{
+		{Branch: "feature"},
+	})
+
+	for _, want := range []string{"headRefOid", "headRepositoryOwner", "first: 10"} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("query missing %q:\n%s", want, query)
+		}
+	}
+}
+
+func TestLoadPullRequestStatesAllowsTokenWithoutGHBinary(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/melonamin/gt.git")
+
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find git: %v", err)
+	}
+	binDir := t.TempDir()
+	if err := os.Symlink(gitPath, filepath.Join(binDir, "git")); err != nil {
+		t.Fatalf("symlink git: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+
+	called := false
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		called = true
+		body := `{"data":{"repository":{"pr0":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"melonamin"}}]}}}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+
+	got, err := loadPullRequestStates(
+		context.Background(),
+		repoPath,
+		[]Worktree{{Branch: "feature", Head: "abc123"}},
+		func(string) (string, string) { return "token", "env" },
+		client,
+	)
+	if err != nil {
+		t.Fatalf("loadPullRequestStates: %v", err)
+	}
+	if !called {
+		t.Fatalf("expected GitHub request without gh binary in PATH")
+	}
+	if got["feature"] != pullRequestStateOpen {
+		t.Fatalf("feature state = %q, want %q", got["feature"], pullRequestStateOpen)
+	}
+}
+
+func TestPullRequestBackoffDecision(t *testing.T) {
+	now := time.Unix(100, 0)
+	if got := nextPullRequestBackoff(now, nil); !got.IsZero() {
+		t.Fatalf("nil error backoff = %v, want zero", got)
+	}
+
+	got := nextPullRequestBackoff(now, errors.New("failed"))
+	want := now.Add(githubPRBackoff)
+	if !got.Equal(want) {
+		t.Fatalf("backoff = %v, want %v", got, want)
+	}
+}
+
+func TestPullRequestSymbolRendering(t *testing.T) {
+	if got := pullRequestStateSymbol(pullRequestStateNone); got != " " {
+		t.Fatalf("none symbol = %q, want blank", got)
+	}
+	for _, state := range []pullRequestState{pullRequestStateOpen, pullRequestStateClosed, pullRequestStateMerged} {
+		if got := pullRequestStateSymbol(state); got != pullRequestSymbol {
+			t.Fatalf("%s symbol = %q, want %q", state, got, pullRequestSymbol)
+		}
+		if got := renderPullRequestMarker(state); !strings.Contains(got, pullRequestSymbol) {
+			t.Fatalf("%s rendered marker = %q, want symbol", state, got)
+		}
+	}
+	if got := renderPullRequestMarker(pullRequestStateNone); got != " " {
+		t.Fatalf("none rendered marker = %q, want blank", got)
 	}
 }
 
