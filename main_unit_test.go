@@ -300,6 +300,36 @@ func TestMapPullRequestStates(t *testing.T) {
 	}
 }
 
+func TestUniquePullRequestLookupsUsesConfiguredUpstream(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/fishy/gt.git")
+	runGit(t, repoPath, "remote", "add", "upstream", "https://github.com/melonamin/gt.git")
+	runGit(t, repoPath, "config", "branch.local-fix.remote", "origin")
+	runGit(t, repoPath, "config", "branch.local-fix.merge", "refs/heads/fix/123")
+
+	lookups := uniquePullRequestLookups(
+		context.Background(),
+		repoPath,
+		[]Worktree{{Branch: "local-fix", Head: "abc123"}},
+		[]gitRemote{
+			{Name: "origin", URL: "https://github.com/fishy/gt.git"},
+			{Name: "upstream", URL: "https://github.com/melonamin/gt.git"},
+		},
+		map[string]bool{"fishy": true, "melonamin": true},
+	)
+
+	if len(lookups) != 1 {
+		t.Fatalf("got %d lookups, want 1", len(lookups))
+	}
+	lookup := lookups[0]
+	if lookup.Branch != "local-fix" || lookup.HeadRef != "fix/123" {
+		t.Fatalf("lookup = %#v, want local branch mapped to upstream branch", lookup)
+	}
+	if !lookup.HeadOwners["fishy"] || len(lookup.HeadOwners) != 1 {
+		t.Fatalf("head owners = %#v, want only upstream owner", lookup.HeadOwners)
+	}
+}
+
 func TestMapPullRequestStatesRequiresHeadAndOwnerMatch(t *testing.T) {
 	var response githubPullRequestGraphQLResponse
 	response.Data.Repository = map[string]githubPullRequestConnection{
@@ -336,7 +366,7 @@ func pullRequestNode(state, head, owner string) githubPullRequestNode {
 
 func TestBuildPullRequestGraphQLQueryIncludesHeadQualifiers(t *testing.T) {
 	query := buildPullRequestGraphQLQuery(githubRepo{Owner: "melonamin", Name: "gt"}, []pullRequestLookup{
-		{Branch: "feature"},
+		{Branch: "local-feature", HeadRef: "feature"},
 	})
 
 	for _, want := range []string{"headRefOid", "headRepositoryOwner", "first: 10"} {
