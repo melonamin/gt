@@ -398,16 +398,54 @@ func getMainWorktreePath(repoPath string) (string, bool) {
 		return "", false
 	}
 
+	output, err = runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil {
+		return "", false
+	}
+	gitDir := filepath.Clean(strings.TrimSpace(string(output)))
+	resolvedGitDir, err := filepath.EvalSymlinks(gitDir)
+	if err != nil {
+		return "", false
+	}
+	resolvedCommonDir, err := filepath.EvalSymlinks(commonDir)
+	if err != nil {
+		return "", false
+	}
+	if resolvedGitDir == resolvedCommonDir {
+		return repoPath, true
+	}
+
+	output, err = runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", false
+	}
+
+	var listedMainWorktreePath string
+	for _, line := range strings.Split(string(output), "\n") {
+		if path, found := strings.CutPrefix(line, "worktree "); found {
+			listedMainWorktreePath = filepath.Clean(path)
+			break
+		}
+	}
+	if listedMainWorktreePath == "" {
+		return "", false
+	}
+
 	mainWorktreePath := filepath.Dir(commonDir)
+	resolvedMainWorktreePath, err := filepath.EvalSymlinks(mainWorktreePath)
+	if err != nil {
+		return "", false
+	}
+	resolvedListedMainWorktreePath, err := filepath.EvalSymlinks(listedMainWorktreePath)
+	if err != nil || resolvedMainWorktreePath != resolvedListedMainWorktreePath {
+		return "", false
+	}
+
 	rootGitDir := filepath.Join(mainWorktreePath, ".git")
 	if info, err := os.Stat(rootGitDir); err != nil || !info.IsDir() {
 		return "", false
 	}
 
-	resolvedCommonDir, err := filepath.EvalSymlinks(commonDir)
-	if err != nil {
-		return "", false
-	}
 	resolvedRootGitDir, err := filepath.EvalSymlinks(rootGitDir)
 	if err != nil {
 		return "", false
@@ -452,6 +490,9 @@ func relPathWithin(basePath, targetPath string) (string, bool) {
 
 func ensureWorktreeDir(repoPath string, config *Config) (string, error) {
 	worktreeDir, baseRepoPath := resolveWorktreeDir(repoPath, config)
+	if filepath.Clean(worktreeDir) == filepath.Clean(baseRepoPath) {
+		return "", fmt.Errorf("worktree directory must not be the repository root")
+	}
 
 	if err := os.MkdirAll(worktreeDir, 0755); err != nil {
 		return "", err
