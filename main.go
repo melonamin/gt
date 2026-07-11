@@ -19,6 +19,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/cli/go-gh/v2/pkg/auth"
 )
 
 const (
@@ -129,22 +130,7 @@ type pullRequestLookup struct {
 type tokenLookupFunc func(host string) (token, source string)
 
 func defaultTokenLookup(host string) (string, string) {
-	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
-		if token := strings.TrimSpace(os.Getenv(name)); token != "" {
-			return token, name
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
-	defer cancel()
-	output, err := exec.CommandContext(ctx, "gh", "auth", "token", "--hostname", host).Output()
-	if err != nil {
-		return "", ""
-	}
-	if token := strings.TrimSpace(string(output)); token != "" {
-		return token, "gh"
-	}
-	return "", ""
+	return auth.TokenForHost(host)
 }
 
 // inputMode represents the current input state of the TUI.
