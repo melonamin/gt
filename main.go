@@ -2518,7 +2518,7 @@ func (m model) View() string {
 			folderLabel := ""
 			if hasFolderMismatch {
 				tail := fmt.Sprintf(" │ %s%s  ", status, aheadBehind)
-				basePrefix := fmt.Sprintf("%s%s%-*s", cursor, pullRequestMarker, branchColumnWidth, branch)
+				basePrefix := fmt.Sprintf("%s%-*s%s", cursor, branchColumnWidth, branch, pullRequestMarker)
 				basePrefixWidth := lipgloss.Width(basePrefix) + lipgloss.Width(tail)
 
 				fullLabel := " " + dimStyle.Render("[📂 "+folderName+"]")
@@ -2530,18 +2530,18 @@ func (m model) View() string {
 				}
 			}
 
-			// Format line: cursor branch [📂 name] │ status ahead/behind  commit
+			// Format line: cursor branch PR [📂 name] │ status ahead/behind  commit
 			var separator string
 			if hasFolderMismatch {
 				separator = " │ "
 			} else {
 				separator = " "
 			}
-			prefix := fmt.Sprintf("%s%s%-*s%s%s%s%s ",
+			prefix := fmt.Sprintf("%s%-*s%s%s%s%s%s ",
 				cursor,
-				pullRequestMarker,
 				branchColumnWidth,
 				branch,
+				pullRequestMarker,
 				folderLabel,
 				separator,
 				status,

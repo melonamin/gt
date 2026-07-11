@@ -495,6 +495,31 @@ func TestPullRequestSymbolRendering(t *testing.T) {
 	}
 }
 
+func TestWorktreeViewPlacesPullRequestMarkerAfterBranch(t *testing.T) {
+	m := model{
+		ui: uiState{width: 120, height: 20},
+		wt: worktreeState{filtered: []Worktree{{
+			Branch:     "feature",
+			Path:       "/repo/.worktrees/feature",
+			PRState:    pullRequestStateOpen,
+			LastCommit: CommitInfo{Message: "commit"},
+		}}},
+		repoPath:        "/repo",
+		mainWorktreeDir: "/repo",
+	}
+
+	view := m.View()
+	branchIndex := strings.Index(view, "feature")
+	prIndex := strings.Index(view, pullRequestSymbol)
+	cleanIndex := strings.Index(view, "✓")
+	if branchIndex == -1 || prIndex == -1 || cleanIndex == -1 {
+		t.Fatalf("expected branch, PR marker, and clean status in view:\n%s", view)
+	}
+	if !(branchIndex < prIndex && prIndex < cleanIndex) {
+		t.Fatalf("expected branch, PR marker, then clean status; indexes = %d, %d, %d:\n%s", branchIndex, prIndex, cleanIndex, view)
+	}
+}
+
 func TestTruncateToWidth(t *testing.T) {
 	tests := []struct {
 		name     string
