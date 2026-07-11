@@ -1929,6 +1929,10 @@ func uniquePullRequestLookups(ctx context.Context, repoPath string, worktrees []
 		if remote, upstreamBranch, ok := branchUpstream(ctx, repoPath, branch); ok {
 			if upstreamRepo, ok := githubRepoForRemote(remotes, remote); ok {
 				lookup.HeadRef = upstreamBranch
+				// A local worktree can be ahead of its pushed branch. The configured
+				// upstream branch and owner identify its PR in that case, whereas the
+				// local SHA does not.
+				lookup.Head = ""
 				lookup.HeadOwners = map[string]bool{strings.ToLower(upstreamRepo.Owner): true}
 			}
 		}

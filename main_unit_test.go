@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -325,8 +326,52 @@ func TestUniquePullRequestLookupsUsesConfiguredUpstream(t *testing.T) {
 	if lookup.Branch != "local-fix" || lookup.HeadRef != "fix/123" {
 		t.Fatalf("lookup = %#v, want local branch mapped to upstream branch", lookup)
 	}
+	if lookup.Head != "" {
+		t.Fatalf("head = %q, want empty so unpushed local commits do not hide the PR", lookup.Head)
+	}
 	if !lookup.HeadOwners["fishy"] || len(lookup.HeadOwners) != 1 {
 		t.Fatalf("head owners = %#v, want only upstream owner", lookup.HeadOwners)
+	}
+}
+
+func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/fishy/gt.git")
+	runGit(t, repoPath, "remote", "add", "upstream", "https://github.com/melonamin/gt.git")
+	runGit(t, repoPath, "config", "branch.local-fix.remote", "origin")
+	runGit(t, repoPath, "config", "branch.local-fix.merge", "refs/heads/fix/123")
+
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var payload struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if !strings.Contains(payload.Query, `headRefName: "fix/123"`) {
+			t.Fatalf("query did not use tracked branch:\n%s", payload.Query)
+		}
+		response := `{"data":{"repository":{"pr0":{"nodes":[{"state":"OPEN","headRefOid":"pushed-sha","headRepositoryOwner":{"login":"fishy"}}]}}}}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(response)),
+			Request:    req,
+		}, nil
+	})}
+
+	states, err := loadPullRequestStates(
+		context.Background(),
+		repoPath,
+		[]Worktree{{Branch: "local-fix", Head: "local-unpushed-sha"}},
+		func(string) (string, string) { return "token", "test" },
+		client,
+	)
+	if err != nil {
+		t.Fatalf("load pull request states: %v", err)
+	}
+	if states["local-fix"] != pullRequestStateOpen {
+		t.Fatalf("state = %q, want %q", states["local-fix"], pullRequestStateOpen)
 	}
 }
 
