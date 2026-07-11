@@ -410,7 +410,10 @@ func TestPullRequestFetchRetriesOnlyOnce(t *testing.T) {
 		wt: worktreeState{
 			prGeneration:    1,
 			prFetchAttempts: 1,
-			worktrees:       []Worktree{{Branch: "feature", Head: "abc123"}},
+			prLookups: []pullRequestLookup{{
+				Branch: "feature", HeadRef: "feature", HeadRepo: githubRepo{Owner: "fishy", Name: "gt"},
+			}},
+			worktrees: []Worktree{{Branch: "feature", Head: "abc123", PRState: pullRequestStatePending}},
 		},
 	}
 
@@ -464,7 +467,7 @@ func TestRenderWorktreeStatusOmitsMissingPullRequestMarker(t *testing.T) {
 	}
 }
 
-func TestApplyPullRequestStatesClearsPendingStateWithoutPR(t *testing.T) {
+func TestApplyPullRequestStatesLeavesUnresolvedStatePending(t *testing.T) {
 	m := model{wt: worktreeState{worktrees: []Worktree{
 		{Branch: "has-pr", PRState: pullRequestStatePending},
 		{Branch: "no-pr", PRState: pullRequestStatePending},
@@ -474,8 +477,8 @@ func TestApplyPullRequestStatesClearsPendingStateWithoutPR(t *testing.T) {
 	if got := m.wt.worktrees[0].PRState; got != pullRequestStateOpen {
 		t.Fatalf("has-pr state = %q, want %q", got, pullRequestStateOpen)
 	}
-	if got := m.wt.worktrees[1].PRState; got != pullRequestStateNone {
-		t.Fatalf("no-pr state = %q, want blank", got)
+	if got := m.wt.worktrees[1].PRState; got != pullRequestStatePending {
+		t.Fatalf("no-pr state = %q, want pending until its lookup succeeds", got)
 	}
 }
 
@@ -485,7 +488,7 @@ func TestMarkPullRequestStatesPendingOnlyForLookupCandidates(t *testing.T) {
 		{Branch: "detached"},
 	}}}
 
-	m.markPullRequestStatesPending()
+	m.markPullRequestStatesPending([]pullRequestLookup{{Branch: "feature"}})
 	if got := m.wt.worktrees[0].PRState; got != pullRequestStatePending {
 		t.Fatalf("feature state = %q, want %q", got, pullRequestStatePending)
 	}
@@ -579,11 +582,99 @@ func TestFetchPullRequestStatesUsesPartialGraphQLData(t *testing.T) {
 		{Branch: "feature", Head: "abc123", HeadOwner: "fishy", HeadRepo: githubRepo{Owner: "fishy", Name: "gt"}},
 		{Branch: "other", Head: "def456", HeadOwner: "missing", HeadRepo: githubRepo{Owner: "missing", Name: "gt"}},
 	})
-	if err != nil {
-		t.Fatalf("fetch pull request states: %v", err)
+	if err == nil {
+		t.Fatal("expected partial GraphQL error")
 	}
 	if got := states["feature"]; got != pullRequestStateOpen {
 		t.Fatalf("feature state = %q, want %q", got, pullRequestStateOpen)
+	}
+	if _, ok := states["other"]; ok {
+		t.Fatalf("failed alias must remain unresolved, got state %q", states["other"])
+	}
+}
+
+func TestFetchPullRequestStatesKeepsOnlyFailedAliasPending(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"data":{"repo0":{"pullRequests":{"nodes":[]},"parent":null},"repo1":null},"errors":[{"message":"repository not found","path":["repo1"]}]}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+
+	states, err := fetchPullRequestStates(context.Background(), client, githubGraphQLEndpoint, "token", []pullRequestLookup{
+		{Branch: "confirmed-none", Head: "abc123", HeadOwner: "fishy", HeadRepo: githubRepo{Owner: "fishy", Name: "gt"}},
+		{Branch: "failed", Head: "def456", HeadOwner: "missing", HeadRepo: githubRepo{Owner: "missing", Name: "gt"}},
+	})
+	if err == nil {
+		t.Fatal("expected partial GraphQL error")
+	}
+	if state, ok := states["confirmed-none"]; !ok || state != pullRequestStateNone {
+		t.Fatalf("confirmed alias = %q, present=%v; want resolved no-PR", state, ok)
+	}
+	if _, ok := states["failed"]; ok {
+		t.Fatal("failed alias must not be cleared to no-PR")
+	}
+}
+
+func TestFetchPullRequestStatesKeepsEarlierBatchResultsWhenLaterBatchFails(t *testing.T) {
+	lookups := make([]pullRequestLookup, githubPRBatchSize+1)
+	for i := range lookups {
+		lookups[i] = pullRequestLookup{
+			Branch:   fmt.Sprintf("branch-%d", i),
+			HeadRef:  fmt.Sprintf("branch-%d", i),
+			HeadRepo: githubRepo{Owner: "fishy", Name: "gt"},
+		}
+	}
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 2 {
+			return &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("bad gateway")), Request: req}, nil
+		}
+		data := make(map[string]any, githubPRBatchSize)
+		for i := 0; i < githubPRBatchSize; i++ {
+			data[githubPullRequestRepositoryAlias(i)] = map[string]any{"pullRequests": map[string]any{"nodes": []any{}}, "parent": nil}
+		}
+		body, err := json.Marshal(map[string]any{"data": data})
+		if err != nil {
+			t.Fatalf("marshal response: %v", err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(body))), Request: req}, nil
+	})}
+
+	states, err := fetchPullRequestStates(context.Background(), client, githubGraphQLEndpoint, "token", lookups)
+	if err == nil {
+		t.Fatal("expected failed second batch")
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+	if got, ok := states["branch-0"]; !ok || got != pullRequestStateNone {
+		t.Fatalf("first batch state = %q, present=%v; want resolved no-PR", got, ok)
+	}
+	if _, ok := states[fmt.Sprintf("branch-%d", githubPRBatchSize)]; ok {
+		t.Fatal("failed second batch must remain unresolved")
+	}
+}
+
+func TestLoadPullRequestStatesSkipsTokenLookupWithoutGitHubCandidates(t *testing.T) {
+	repoPath := initRepo(t)
+	called := false
+	states, err := loadPullRequestStates(context.Background(), repoPath, []Worktree{{Branch: "local", Head: "abc123"}}, func(string) (string, string) {
+		called = true
+		return "", ""
+	}, nil)
+	if err != nil {
+		t.Fatalf("load pull request states: %v", err)
+	}
+	if called {
+		t.Fatal("token lookup must not run when no GitHub remotes are eligible")
+	}
+	if len(states) != 0 {
+		t.Fatalf("states = %#v, want no PR candidates", states)
 	}
 }
 
