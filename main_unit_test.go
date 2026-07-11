@@ -195,94 +195,20 @@ func TestParseGitHubRemoteURL(t *testing.T) {
 	}
 }
 
-func TestChooseBaseGitHubRepo(t *testing.T) {
-	tests := []struct {
-		name    string
-		remotes []gitRemote
-		want    githubRepo
-		ok      bool
-	}{
-		{
-			name: "upstream preferred over origin",
-			remotes: []gitRemote{
-				{Name: "origin", URL: "https://github.com/fishy/gt.git"},
-				{Name: "upstream", URL: "https://github.com/melonamin/gt.git"},
-			},
-			want: githubRepo{Owner: "melonamin", Name: "gt"},
-			ok:   true,
-		},
-		{
-			name: "origin preferred over other github remote",
-			remotes: []gitRemote{
-				{Name: "fork", URL: "https://github.com/fishy/gt.git"},
-				{Name: "origin", URL: "https://github.com/melonamin/gt.git"},
-			},
-			want: githubRepo{Owner: "melonamin", Name: "gt"},
-			ok:   true,
-		},
-		{
-			name: "first github remote fallback",
-			remotes: []gitRemote{
-				{Name: "mirror", URL: "https://gitlab.com/melonamin/gt.git"},
-				{Name: "fork", URL: "git@github.com:fishy/gt.git"},
-			},
-			want: githubRepo{Owner: "fishy", Name: "gt"},
-			ok:   true,
-		},
-		{
-			name: "no github remotes",
-			remotes: []gitRemote{
-				{Name: "origin", URL: "https://gitlab.com/melonamin/gt.git"},
-			},
-			want: githubRepo{},
-			ok:   false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, ok := chooseBaseGitHubRepo(tt.remotes)
-			if ok != tt.ok {
-				t.Fatalf("ok = %v, want %v", ok, tt.ok)
-			}
-			if got != tt.want {
-				t.Fatalf("repo = %+v, want %+v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestGitHubRemoteOwners(t *testing.T) {
-	got := githubRemoteOwners([]gitRemote{
-		{Name: "origin", URL: "git@github.com:fishy/gt.git"},
-		{Name: "upstream", URL: "https://github.com/melonamin/gt.git"},
-		{Name: "other", URL: "https://gitlab.com/example/gt.git"},
-	}, githubRepo{Owner: "melonamin", Name: "gt"})
-
-	for _, owner := range []string{"fishy", "melonamin"} {
-		if !got[owner] {
-			t.Fatalf("expected owner %q in %#v", owner, got)
-		}
-	}
-	if got["example"] {
-		t.Fatalf("did not expect non-GitHub owner in %#v", got)
-	}
-}
-
 func TestMapPullRequestStates(t *testing.T) {
 	var response githubPullRequestGraphQLResponse
-	response.Data.Repository = map[string]githubPullRequestConnection{
-		"pr0": {Nodes: []githubPullRequestNode{pullRequestNode("OPEN", "aaa", "fishy")}},
-		"pr1": {Nodes: []githubPullRequestNode{pullRequestNode("CLOSED", "bbb", "fishy")}},
-		"pr2": {Nodes: []githubPullRequestNode{pullRequestNode("MERGED", "ccc", "melonamin")}},
-		"pr3": {Nodes: nil},
+	response.Data.Repository = map[string]githubPullRequestRepository{
+		"repo0": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("OPEN", "aaa", "fishy")}}},
+		"repo1": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("CLOSED", "bbb", "fishy")}}},
+		"repo2": {Parent: &githubPullRequestRepository{PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("MERGED", "ccc", "melonamin")}}}},
+		"repo3": {PullRequests: githubPullRequestConnection{}},
 	}
 
 	got := mapPullRequestStates([]pullRequestLookup{
-		{Branch: "feature", Head: "aaa", HeadOwners: map[string]bool{"fishy": true}},
-		{Branch: "bugfix", Head: "bbb", HeadOwners: map[string]bool{"fishy": true}},
-		{Branch: "done", Head: "ccc", HeadOwners: map[string]bool{"melonamin": true}},
-		{Branch: "empty", Head: "ddd", HeadOwners: map[string]bool{"fishy": true}},
+		{Branch: "feature", Head: "aaa", HeadOwner: "fishy"},
+		{Branch: "bugfix", Head: "bbb", HeadOwner: "fishy"},
+		{Branch: "done", Head: "ccc", HeadOwner: "melonamin"},
+		{Branch: "empty", Head: "ddd", HeadOwner: "fishy"},
 	}, response)
 	want := map[string]pullRequestState{
 		"feature": pullRequestStateOpen,
@@ -303,11 +229,10 @@ func TestMapPullRequestStates(t *testing.T) {
 	}
 }
 
-func TestUniquePullRequestLookupsUsesConfiguredUpstream(t *testing.T) {
+func TestUniquePullRequestLookupsUsesConfiguredRemoteIdentity(t *testing.T) {
 	repoPath := initRepo(t)
-	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/fishy/gt.git")
-	runGit(t, repoPath, "remote", "add", "upstream", "https://github.com/melonamin/gt.git")
-	runGit(t, repoPath, "config", "branch.local-fix.remote", "origin")
+	runGit(t, repoPath, "remote", "add", "canonical", "https://github.com/fishy/gt.git")
+	runGit(t, repoPath, "config", "branch.local-fix.remote", "canonical")
 	runGit(t, repoPath, "config", "branch.local-fix.merge", "refs/heads/fix/123")
 
 	lookups := uniquePullRequestLookups(
@@ -315,10 +240,8 @@ func TestUniquePullRequestLookupsUsesConfiguredUpstream(t *testing.T) {
 		repoPath,
 		[]Worktree{{Branch: "local-fix", Head: "abc123"}},
 		[]gitRemote{
-			{Name: "origin", URL: "https://github.com/fishy/gt.git"},
-			{Name: "upstream", URL: "https://github.com/melonamin/gt.git"},
+			{Name: "canonical", URL: "https://github.com/fishy/gt.git"},
 		},
-		map[string]bool{"fishy": true, "melonamin": true},
 	)
 
 	if len(lookups) != 1 {
@@ -331,15 +254,14 @@ func TestUniquePullRequestLookupsUsesConfiguredUpstream(t *testing.T) {
 	if lookup.Head != "" {
 		t.Fatalf("head = %q, want empty so unpushed local commits do not hide the PR", lookup.Head)
 	}
-	if !lookup.HeadOwners["fishy"] || len(lookup.HeadOwners) != 1 {
-		t.Fatalf("head owners = %#v, want only upstream owner", lookup.HeadOwners)
+	if lookup.HeadRepo != (githubRepo{Owner: "fishy", Name: "gt"}) || lookup.HeadOwner != "fishy" {
+		t.Fatalf("lookup = %#v, want configured remote identity", lookup)
 	}
 }
 
 func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T) {
 	repoPath := initRepo(t)
 	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/fishy/gt.git")
-	runGit(t, repoPath, "remote", "add", "upstream", "https://github.com/melonamin/gt.git")
 	runGit(t, repoPath, "config", "branch.local-fix.remote", "origin")
 	runGit(t, repoPath, "config", "branch.local-fix.merge", "refs/heads/fix/123")
 
@@ -353,7 +275,12 @@ func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T)
 		if !strings.Contains(payload.Query, `headRefName: "fix/123"`) {
 			t.Fatalf("query did not use tracked branch:\n%s", payload.Query)
 		}
-		response := `{"data":{"repository":{"pr0":{"nodes":[{"state":"OPEN","headRefOid":"pushed-sha","headRepositoryOwner":{"login":"fishy"}}]}}}}`
+		for _, want := range []string{`repository(owner: "fishy", name: "gt")`, "parent {", "pullRequests"} {
+			if !strings.Contains(payload.Query, want) {
+				t.Fatalf("query missing %q:\n%s", want, payload.Query)
+			}
+		}
+		response := `{"data":{"repository":{"repo0":{"pullRequests":{"nodes":[]},"parent":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"pushed-sha","headRepositoryOwner":{"login":"fishy"}}]}}}}}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -379,20 +306,20 @@ func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T)
 
 func TestMapPullRequestStatesRequiresHeadAndOwnerMatch(t *testing.T) {
 	var response githubPullRequestGraphQLResponse
-	response.Data.Repository = map[string]githubPullRequestConnection{
-		"pr0": {Nodes: []githubPullRequestNode{
+	response.Data.Repository = map[string]githubPullRequestRepository{
+		"repo0": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{
 			pullRequestNode("MERGED", "old-sha", "fishy"),
 			pullRequestNode("OPEN", "current-sha", "someone-else"),
 			pullRequestNode("OPEN", "current-sha", "fishy"),
-		}},
-		"pr1": {Nodes: []githubPullRequestNode{
+		}}},
+		"repo1": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{
 			pullRequestNode("CLOSED", "matching-sha", "someone-else"),
-		}},
+		}}},
 	}
 
 	got := mapPullRequestStates([]pullRequestLookup{
-		{Branch: "feature", Head: "current-sha", HeadOwners: map[string]bool{"fishy": true}},
-		{Branch: "other", Head: "matching-sha", HeadOwners: map[string]bool{"fishy": true}},
+		{Branch: "feature", Head: "current-sha", HeadOwner: "fishy"},
+		{Branch: "other", Head: "matching-sha", HeadOwner: "fishy"},
 	}, response)
 
 	if got["feature"] != pullRequestStateOpen {
@@ -411,12 +338,12 @@ func pullRequestNode(state, head, owner string) githubPullRequestNode {
 	return node
 }
 
-func TestBuildPullRequestGraphQLQueryIncludesHeadQualifiers(t *testing.T) {
-	query := buildPullRequestGraphQLQuery(githubRepo{Owner: "melonamin", Name: "gt"}, []pullRequestLookup{
-		{Branch: "local-feature", HeadRef: "feature"},
+func TestBuildPullRequestGraphQLQueryIncludesForkParentAndHeadQualifiers(t *testing.T) {
+	query := buildPullRequestGraphQLQuery([]pullRequestLookup{
+		{Branch: "local-feature", HeadRef: "feature", HeadRepo: githubRepo{Owner: "fishy", Name: "gt"}},
 	})
 
-	for _, want := range []string{"headRefOid", "headRepositoryOwner", "first: 10"} {
+	for _, want := range []string{`repository(owner: "fishy", name: "gt")`, "parent {", "headRefOid", "headRepositoryOwner", "first: 10"} {
 		if !strings.Contains(query, want) {
 			t.Fatalf("query missing %q:\n%s", want, query)
 		}
@@ -440,7 +367,7 @@ func TestLoadPullRequestStatesAllowsTokenWithoutGHBinary(t *testing.T) {
 	called := false
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		called = true
-		body := `{"data":{"repository":{"pr0":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"melonamin"}}]}}}}`
+		body := `{"data":{"repository":{"repo0":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"melonamin"}}]}}}}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),

@@ -120,10 +120,11 @@ type githubRepo struct {
 }
 
 type pullRequestLookup struct {
-	Branch     string
-	HeadRef    string
-	Head       string
-	HeadOwners map[string]bool
+	Branch    string
+	HeadRef   string
+	Head      string
+	HeadOwner string
+	HeadRepo  githubRepo
 }
 
 type tokenLookupFunc func(host string) (token, source string)
@@ -402,41 +403,6 @@ func parseGitHubRemoteURL(remoteURL string) (githubRepo, bool) {
 	}
 
 	return githubRepo{}, false
-}
-
-func chooseBaseGitHubRepo(remotes []gitRemote) (githubRepo, bool) {
-	for _, preferred := range []string{"upstream", "origin"} {
-		for _, remote := range remotes {
-			if remote.Name != preferred {
-				continue
-			}
-			if repo, ok := parseGitHubRemoteURL(remote.URL); ok {
-				return repo, true
-			}
-		}
-	}
-
-	for _, remote := range remotes {
-		if repo, ok := parseGitHubRemoteURL(remote.URL); ok {
-			return repo, true
-		}
-	}
-
-	return githubRepo{}, false
-}
-
-func githubRemoteOwners(remotes []gitRemote, baseRepo githubRepo) map[string]bool {
-	owners := make(map[string]bool)
-	if baseRepo.Owner != "" {
-		owners[strings.ToLower(baseRepo.Owner)] = true
-	}
-	for _, remote := range remotes {
-		repo, ok := parseGitHubRemoteURL(remote.URL)
-		if ok && repo.Owner != "" {
-			owners[strings.ToLower(repo.Owner)] = true
-		}
-	}
-	return owners
 }
 
 func pullRequestStateFromGitHub(state string) pullRequestState {
@@ -1854,28 +1820,33 @@ type githubPullRequestConnection struct {
 	Nodes []githubPullRequestNode `json:"nodes"`
 }
 
+type githubPullRequestRepository struct {
+	PullRequests githubPullRequestConnection  `json:"pullRequests"`
+	Parent       *githubPullRequestRepository `json:"parent"`
+}
+
 type githubPullRequestGraphQLResponse struct {
 	Data struct {
-		Repository map[string]githubPullRequestConnection `json:"repository"`
+		Repository map[string]githubPullRequestRepository `json:"repository"`
 	} `json:"data"`
 	Errors []struct {
 		Message string `json:"message"`
 	} `json:"errors"`
 }
 
-func githubPullRequestAlias(index int) string {
-	return fmt.Sprintf("pr%d", index)
+func githubPullRequestRepositoryAlias(index int) string {
+	return fmt.Sprintf("repo%d", index)
 }
 
 func pullRequestNodeMatchesLookup(node githubPullRequestNode, lookup pullRequestLookup) bool {
 	if lookup.Head != "" && !strings.EqualFold(node.HeadRefOID, lookup.Head) {
 		return false
 	}
-	if len(lookup.HeadOwners) == 0 {
+	if lookup.HeadOwner == "" {
 		return true
 	}
 	owner := strings.ToLower(strings.TrimSpace(node.HeadRepositoryOwner.Login))
-	return owner != "" && lookup.HeadOwners[owner]
+	return owner != "" && owner == strings.ToLower(lookup.HeadOwner)
 }
 
 func mapPullRequestStates(lookups []pullRequestLookup, response githubPullRequestGraphQLResponse) map[string]pullRequestState {
@@ -1884,16 +1855,25 @@ func mapPullRequestStates(lookups []pullRequestLookup, response githubPullReques
 		if lookup.Branch == "" {
 			continue
 		}
-		conn, ok := response.Data.Repository[githubPullRequestAlias(i)]
-		if !ok || len(conn.Nodes) == 0 {
+		repo, ok := response.Data.Repository[githubPullRequestRepositoryAlias(i)]
+		if !ok {
 			continue
 		}
-		for _, node := range conn.Nodes {
-			if !pullRequestNodeMatchesLookup(node, lookup) {
-				continue
+		connections := []githubPullRequestConnection{repo.PullRequests}
+		if repo.Parent != nil {
+			connections = append([]githubPullRequestConnection{repo.Parent.PullRequests}, connections...)
+		}
+		for _, conn := range connections {
+			for _, node := range conn.Nodes {
+				if !pullRequestNodeMatchesLookup(node, lookup) {
+					continue
+				}
+				if state := pullRequestStateFromGitHub(node.State); state != pullRequestStateNone {
+					states[lookup.Branch] = state
+					break
+				}
 			}
-			if state := pullRequestStateFromGitHub(node.State); state != pullRequestStateNone {
-				states[lookup.Branch] = state
+			if _, ok := states[lookup.Branch]; ok {
 				break
 			}
 		}
@@ -1925,55 +1905,85 @@ func githubRepoForRemote(remotes []gitRemote, remoteName string) (githubRepo, bo
 	return githubRepo{}, false
 }
 
-func uniquePullRequestLookups(ctx context.Context, repoPath string, worktrees []Worktree, remotes []gitRemote, headOwners map[string]bool) []pullRequestLookup {
+func githubReposForRemotes(remotes []gitRemote) []githubRepo {
+	seen := make(map[githubRepo]bool)
+	repos := make([]githubRepo, 0, len(remotes))
+	for _, remote := range remotes {
+		repo, ok := parseGitHubRemoteURL(remote.URL)
+		if !ok || seen[repo] {
+			continue
+		}
+		seen[repo] = true
+		repos = append(repos, repo)
+	}
+	return repos
+}
+
+func uniquePullRequestLookups(ctx context.Context, repoPath string, worktrees []Worktree, remotes []gitRemote) []pullRequestLookup {
 	seen := make(map[string]bool)
 	unique := make([]pullRequestLookup, 0, len(worktrees))
+	fallbackRepos := githubReposForRemotes(remotes)
 	for _, wt := range worktrees {
 		branch := strings.TrimSpace(wt.Branch)
 		head := strings.TrimSpace(wt.Head)
-		key := branch + "\x00" + strings.ToLower(head)
-		if branch == "" || head == "" || seen[key] {
+		if branch == "" || head == "" {
 			continue
-		}
-		seen[key] = true
-		lookup := pullRequestLookup{
-			Branch:     branch,
-			HeadRef:    branch,
-			Head:       head,
-			HeadOwners: headOwners,
 		}
 		if remote, upstreamBranch, ok := branchUpstream(ctx, repoPath, branch); ok {
 			if upstreamRepo, ok := githubRepoForRemote(remotes, remote); ok {
-				lookup.HeadRef = upstreamBranch
-				// A local worktree can be ahead of its pushed branch. The configured
-				// upstream branch and owner identify its PR in that case, whereas the
-				// local SHA does not.
-				lookup.Head = ""
-				lookup.HeadOwners = map[string]bool{strings.ToLower(upstreamRepo.Owner): true}
+				lookup := pullRequestLookup{
+					Branch:    branch,
+					HeadRef:   upstreamBranch,
+					HeadOwner: strings.ToLower(upstreamRepo.Owner),
+					HeadRepo:  upstreamRepo,
+				}
+				key := fmt.Sprintf("%s\x00%s\x00%s/%s", lookup.Branch, lookup.HeadRef, lookup.HeadRepo.Owner, lookup.HeadRepo.Name)
+				if !seen[key] {
+					seen[key] = true
+					unique = append(unique, lookup)
+				}
+				continue
 			}
 		}
-		unique = append(unique, lookup)
+		for _, fallbackRepo := range fallbackRepos {
+			lookup := pullRequestLookup{
+				Branch:    branch,
+				HeadRef:   branch,
+				Head:      head,
+				HeadOwner: strings.ToLower(fallbackRepo.Owner),
+				HeadRepo:  fallbackRepo,
+			}
+			key := fmt.Sprintf("%s\x00%s\x00%s\x00%s/%s", lookup.Branch, lookup.HeadRef, lookup.Head, lookup.HeadRepo.Owner, lookup.HeadRepo.Name)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			unique = append(unique, lookup)
+		}
 	}
 	return unique
 }
 
-func buildPullRequestGraphQLQuery(repo githubRepo, lookups []pullRequestLookup) string {
+func buildPullRequestGraphQLQuery(lookups []pullRequestLookup) string {
 	var b strings.Builder
 	b.WriteString("query {\n")
-	b.WriteString(fmt.Sprintf("  repository(owner: %s, name: %s) {\n", strconv.Quote(repo.Owner), strconv.Quote(repo.Name)))
 	for i, lookup := range lookups {
+		b.WriteString(fmt.Sprintf("  %s: repository(owner: %s, name: %s) {\n", githubPullRequestRepositoryAlias(i), strconv.Quote(lookup.HeadRepo.Owner), strconv.Quote(lookup.HeadRepo.Name)))
 		b.WriteString(fmt.Sprintf(
-			"    %s: pullRequests(first: 10, headRefName: %s, states: [OPEN, CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { state headRefOid headRepositoryOwner { login } } }\n",
-			githubPullRequestAlias(i),
+			"    pullRequests(first: 10, headRefName: %s, states: [OPEN, CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { state headRefOid headRepositoryOwner { login } } }\n",
 			strconv.Quote(lookup.HeadRef),
 		))
+		b.WriteString(fmt.Sprintf(
+			"    parent { pullRequests(first: 10, headRefName: %s, states: [OPEN, CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { state headRefOid headRepositoryOwner { login } } } }\n",
+			strconv.Quote(lookup.HeadRef),
+		))
+		b.WriteString("  }\n")
 	}
-	b.WriteString("  }\n")
 	b.WriteString("}\n")
 	return b.String()
 }
 
-func fetchPullRequestStates(ctx context.Context, client *http.Client, endpoint, token string, repo githubRepo, lookups []pullRequestLookup) (map[string]pullRequestState, error) {
+func fetchPullRequestStates(ctx context.Context, client *http.Client, endpoint, token string, lookups []pullRequestLookup) (map[string]pullRequestState, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -1989,7 +1999,7 @@ func fetchPullRequestStates(ctx context.Context, client *http.Client, endpoint, 
 		}
 		batch := lookups[start:end]
 		body, err := json.Marshal(map[string]string{
-			"query": buildPullRequestGraphQLQuery(repo, batch),
+			"query": buildPullRequestGraphQLQuery(batch),
 		})
 		if err != nil {
 			return nil, err
@@ -2048,13 +2058,9 @@ func loadPullRequestStates(ctx context.Context, repoPath string, worktrees []Wor
 	if err != nil {
 		return nil, err
 	}
-	repo, ok := chooseBaseGitHubRepo(remotes)
-	if !ok {
-		return map[string]pullRequestState{}, nil
-	}
-	lookups := uniquePullRequestLookups(ctx, repoPath, worktrees, remotes, githubRemoteOwners(remotes, repo))
+	lookups := uniquePullRequestLookups(ctx, repoPath, worktrees, remotes)
 
-	return fetchPullRequestStates(ctx, client, githubGraphQLEndpoint, token, repo, lookups)
+	return fetchPullRequestStates(ctx, client, githubGraphQLEndpoint, token, lookups)
 }
 
 func findRemoteBranch(repoPath, remote, branch string) (*remoteBranchMatch, bool) {
