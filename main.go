@@ -1830,9 +1830,7 @@ type githubPullRequestRepository struct {
 }
 
 type githubPullRequestGraphQLResponse struct {
-	Data struct {
-		Repository map[string]*githubPullRequestRepository `json:"repository"`
-	} `json:"data"`
+	Data   map[string]*githubPullRequestRepository `json:"data"`
 	Errors []struct {
 		Message string `json:"message"`
 	} `json:"errors"`
@@ -1859,7 +1857,7 @@ func mapPullRequestStates(lookups []pullRequestLookup, response githubPullReques
 		if lookup.Branch == "" {
 			continue
 		}
-		repo, ok := response.Data.Repository[githubPullRequestRepositoryAlias(i)]
+		repo, ok := response.Data[githubPullRequestRepositoryAlias(i)]
 		if !ok || repo == nil {
 			continue
 		}
@@ -2034,7 +2032,7 @@ func fetchPullRequestStates(ctx context.Context, client *http.Client, endpoint, 
 				return
 			}
 			usableResponse := false
-			for _, repository := range graphQLResp.Data.Repository {
+			for _, repository := range graphQLResp.Data {
 				if repository != nil {
 					usableResponse = true
 					break

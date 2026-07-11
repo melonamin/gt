@@ -197,7 +197,7 @@ func TestParseGitHubRemoteURL(t *testing.T) {
 
 func TestMapPullRequestStates(t *testing.T) {
 	var response githubPullRequestGraphQLResponse
-	response.Data.Repository = map[string]*githubPullRequestRepository{
+	response.Data = map[string]*githubPullRequestRepository{
 		"repo0": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("OPEN", "aaa", "fishy")}}},
 		"repo1": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("CLOSED", "bbb", "fishy")}}},
 		"repo2": {Parent: &githubPullRequestRepository{PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("MERGED", "ccc", "melonamin")}}}},
@@ -280,7 +280,7 @@ func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T)
 				t.Fatalf("query missing %q:\n%s", want, payload.Query)
 			}
 		}
-		response := `{"data":{"repository":{"repo0":{"pullRequests":{"nodes":[]},"parent":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"pushed-sha","headRepositoryOwner":{"login":"fishy"}}]}}}}}}`
+		response := `{"data":{"repo0":{"pullRequests":{"nodes":[]},"parent":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"pushed-sha","headRepositoryOwner":{"login":"fishy"}}]}}}}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -306,7 +306,7 @@ func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T)
 
 func TestMapPullRequestStatesRequiresHeadAndOwnerMatch(t *testing.T) {
 	var response githubPullRequestGraphQLResponse
-	response.Data.Repository = map[string]*githubPullRequestRepository{
+	response.Data = map[string]*githubPullRequestRepository{
 		"repo0": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{
 			pullRequestNode("MERGED", "old-sha", "fishy"),
 			pullRequestNode("OPEN", "current-sha", "someone-else"),
@@ -367,7 +367,7 @@ func TestLoadPullRequestStatesUsesProvidedTokenLookupWithoutGHBinary(t *testing.
 	called := false
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		called = true
-		body := `{"data":{"repository":{"repo0":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"melonamin"}}]}}}}}`
+		body := `{"data":{"repo0":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"melonamin"}}]}}}}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -566,7 +566,7 @@ func TestWorktreeViewDoesNotTruncateBranchWhenThereIsRoom(t *testing.T) {
 
 func TestFetchPullRequestStatesUsesPartialGraphQLData(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		body := `{"data":{"repository":{"repo0":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"fishy"}}]},"parent":null},"repo1":null}},"errors":[{"message":"repository not found"}]}`
+		body := `{"data":{"repo0":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"fishy"}}]},"parent":null},"repo1":null},"errors":[{"message":"repository not found"}]}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
