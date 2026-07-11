@@ -102,10 +102,11 @@ type CommitInfo struct {
 type pullRequestState string
 
 const (
-	pullRequestStateNone   pullRequestState = ""
-	pullRequestStateOpen   pullRequestState = "open"
-	pullRequestStateClosed pullRequestState = "closed"
-	pullRequestStateMerged pullRequestState = "merged"
+	pullRequestStateNone    pullRequestState = ""
+	pullRequestStatePending pullRequestState = "pending"
+	pullRequestStateOpen    pullRequestState = "open"
+	pullRequestStateClosed  pullRequestState = "closed"
+	pullRequestStateMerged  pullRequestState = "merged"
 )
 
 type gitRemote struct {
@@ -452,14 +453,20 @@ func pullRequestStateFromGitHub(state string) pullRequestState {
 }
 
 func pullRequestStateSymbol(state pullRequestState) string {
-	if state == pullRequestStateNone {
+	switch state {
+	case pullRequestStatePending:
+		return "?"
+	case pullRequestStateNone:
 		return " "
+	default:
+		return pullRequestSymbol
 	}
-	return pullRequestSymbol
 }
 
 func renderPullRequestMarker(state pullRequestState) string {
 	switch state {
+	case pullRequestStatePending:
+		return dimStyle.Render("?")
 	case pullRequestStateOpen:
 		return pullRequestOpenStyle.Render(pullRequestSymbol)
 	case pullRequestStateClosed:
@@ -1177,12 +1184,21 @@ func (m *model) applyWorktreeDetail(detail worktreeDetails) {
 }
 
 func (m *model) applyPullRequestStates(states map[string]pullRequestState) {
-	if len(states) == 0 {
-		return
-	}
 	for i := range m.wt.worktrees {
 		if state, ok := states[m.wt.worktrees[i].Branch]; ok {
 			m.wt.worktrees[i].PRState = state
+		} else {
+			m.wt.worktrees[i].PRState = pullRequestStateNone
+		}
+	}
+	m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
+}
+
+func (m *model) markPullRequestStatesPending() {
+	for i := range m.wt.worktrees {
+		wt := &m.wt.worktrees[i]
+		if wt.Branch != "" && wt.Head != "" {
+			wt.PRState = pullRequestStatePending
 		}
 	}
 	m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
@@ -1561,11 +1577,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickCmd()
 		}
 		m.wt.worktrees = msg.worktrees
-		m.wt.filtered = filterWorktrees(msg.worktrees, m.wt.searchTerm)
 		m.wt.defaultBranch = msg.defaultBranch
 		m.mainWorktreeDir = msg.mainWorktreeDir
 		m.wt.detailGeneration++
 		m.wt.prGeneration++
+		m.markPullRequestStatesPending()
 		m.resetDetailQueue()
 		// Find current worktree path for tracking previous (session-only)
 		if m.wt.previousWorktree == "" {
@@ -2743,6 +2759,7 @@ INTERACTIVE MODE COMMANDS:
     q        Quit
 
 VISUAL STATUS:
+    ?        GitHub PR status is loading or unavailable
     ⎇        Lazygit-style GitHub PR status indicator (open, closed, or merged)
 
 QUICK ACTIONS (from actions menu):

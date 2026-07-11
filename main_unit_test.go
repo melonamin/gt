@@ -484,6 +484,12 @@ func TestPullRequestSymbolRendering(t *testing.T) {
 	if got := pullRequestStateSymbol(pullRequestStateNone); got != " " {
 		t.Fatalf("none symbol = %q, want blank", got)
 	}
+	if got := pullRequestStateSymbol(pullRequestStatePending); got != "?" {
+		t.Fatalf("pending symbol = %q, want question mark", got)
+	}
+	if got := renderPullRequestMarker(pullRequestStatePending); !strings.Contains(got, "?") {
+		t.Fatalf("pending marker = %q, want question mark", got)
+	}
 	for _, state := range []pullRequestState{pullRequestStateOpen, pullRequestStateClosed, pullRequestStateMerged} {
 		if got := pullRequestStateSymbol(state); got != pullRequestSymbol {
 			t.Fatalf("%s symbol = %q, want %q", state, got, pullRequestSymbol)
@@ -494,6 +500,36 @@ func TestPullRequestSymbolRendering(t *testing.T) {
 	}
 	if got := renderPullRequestMarker(pullRequestStateNone); got != " " {
 		t.Fatalf("none rendered marker = %q, want blank", got)
+	}
+}
+
+func TestApplyPullRequestStatesClearsPendingStateWithoutPR(t *testing.T) {
+	m := model{wt: worktreeState{worktrees: []Worktree{
+		{Branch: "has-pr", PRState: pullRequestStatePending},
+		{Branch: "no-pr", PRState: pullRequestStatePending},
+	}}}
+
+	m.applyPullRequestStates(map[string]pullRequestState{"has-pr": pullRequestStateOpen})
+	if got := m.wt.worktrees[0].PRState; got != pullRequestStateOpen {
+		t.Fatalf("has-pr state = %q, want %q", got, pullRequestStateOpen)
+	}
+	if got := m.wt.worktrees[1].PRState; got != pullRequestStateNone {
+		t.Fatalf("no-pr state = %q, want blank", got)
+	}
+}
+
+func TestMarkPullRequestStatesPendingOnlyForLookupCandidates(t *testing.T) {
+	m := model{wt: worktreeState{worktrees: []Worktree{
+		{Branch: "feature", Head: "abc123"},
+		{Branch: "detached"},
+	}}}
+
+	m.markPullRequestStatesPending()
+	if got := m.wt.worktrees[0].PRState; got != pullRequestStatePending {
+		t.Fatalf("feature state = %q, want %q", got, pullRequestStatePending)
+	}
+	if got := m.wt.worktrees[1].PRState; got != pullRequestStateNone {
+		t.Fatalf("detached state = %q, want blank", got)
 	}
 }
 
