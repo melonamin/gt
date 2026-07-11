@@ -511,11 +511,6 @@ func ensureWorktreeDir(repoPath string, config *Config) (string, error) {
 	return worktreeDir, nil
 }
 
-func worktreePathForBranch(repoPath, branch string, config *Config) string {
-	worktreeDir, _ := resolveWorktreeDir(repoPath, config)
-	return filepath.Join(worktreeDir, strings.ReplaceAll(branch, "/", "-"))
-}
-
 // runGitCmd executes a git command with context support for cancellation.
 func runGitCmd(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
@@ -934,7 +929,7 @@ func createWorktreeCmd(repoPath, branch string, config *Config) tea.Cmd {
 		cfg = &copy
 	}
 	return func() tea.Msg {
-		err := createWorktree(repoPath, branch, cfg)
+		_, err := createWorktree(repoPath, branch, cfg)
 		return worktreeCreatedMsg{
 			branch: branch,
 			err:    err,
@@ -1702,14 +1697,14 @@ func resolveRemoteBranchForSwitch(repoPath, branch string) (*remoteBranchMatch, 
 	return &matches[0], nil
 }
 
-func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, config *Config) error {
+func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, config *Config) (string, error) {
 	if err := validateBranchName(worktreeName); err != nil {
-		return fmt.Errorf("invalid branch name: %w", err)
+		return "", fmt.Errorf("invalid branch name: %w", err)
 	}
 
 	worktreeDir, err := ensureWorktreeDir(repoPath, config)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// Generate worktree path
@@ -1723,21 +1718,21 @@ func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, confi
 		args = []string{"worktree", "add", worktreePath, worktreeName}
 		output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 		if err != nil {
-			return fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
+			return "", fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
 		}
 	}
 
-	return nil
+	return worktreePath, nil
 }
 
-func createWorktree(repoPath, branch string, config *Config) error {
+func createWorktree(repoPath, branch string, config *Config) (string, error) {
 	if err := validateBranchName(branch); err != nil {
-		return fmt.Errorf("invalid branch name: %w", err)
+		return "", fmt.Errorf("invalid branch name: %w", err)
 	}
 
 	worktreeDir, err := ensureWorktreeDir(repoPath, config)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// Generate worktree path
@@ -1756,18 +1751,18 @@ func createWorktree(repoPath, branch string, config *Config) error {
 	default:
 		match, err := resolveRemoteBranchForSwitch(repoPath, branch)
 		if err != nil {
-			return err
+			return "", err
 		}
 		remoteMatch = match
 		if remoteMatch != nil {
 			if remoteMatch.needsFetch {
 				if err := fetchRemoteBranch(repoPath, remoteMatch.remote, branch); err != nil {
-					return err
+					return "", err
 				}
 			}
 			fullRef := fmt.Sprintf("refs/remotes/%s/%s", remoteMatch.remote, branch)
 			if !refExists(repoPath, fullRef) {
-				return fmt.Errorf("failed to resolve remote branch %s", remoteMatch.ref)
+				return "", fmt.Errorf("failed to resolve remote branch %s", remoteMatch.ref)
 			}
 			// Use --no-track and set upstream explicitly afterwards. `--track`
 			// rejects start points that aren't covered by the remote's
@@ -1781,7 +1776,7 @@ func createWorktree(repoPath, branch string, config *Config) error {
 
 	output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 	if err != nil {
-		return fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
+		return "", fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
 	}
 
 	// Point the new branch's upstream at the remote branch we used. Done by
@@ -1793,14 +1788,14 @@ func createWorktree(repoPath, branch string, config *Config) error {
 		mergeKey := fmt.Sprintf("branch.%s.merge", branch)
 		mergeRef := fmt.Sprintf("refs/heads/%s", branch)
 		if out, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "config", remoteKey, remoteMatch.remote); err != nil {
-			return fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
+			return "", fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
 		}
 		if out, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "config", mergeKey, mergeRef); err != nil {
-			return fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
+			return "", fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
 		}
 	}
 
-	return nil
+	return worktreePath, nil
 }
 
 func deleteWorktree(repoPath, worktreePath string) error {
@@ -2594,21 +2589,20 @@ func main() {
 			config = &Config{}
 		}
 
-		// Create the worktree
+		// Create the worktree.
+		var worktreePath string
 		if sourceBranch != "" {
 			fmt.Printf("Creating worktree '%s' from branch '%s'...\n", worktreeName, sourceBranch)
-			err = createWorktreeFromBranch(repoPath, worktreeName, sourceBranch, config)
+			worktreePath, err = createWorktreeFromBranch(repoPath, worktreeName, sourceBranch, config)
 		} else {
 			fmt.Printf("Creating worktree '%s'...\n", worktreeName)
-			err = createWorktree(repoPath, worktreeName, config)
+			worktreePath, err = createWorktree(repoPath, worktreeName, config)
 		}
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating worktree: %v\n", err)
 			os.Exit(1)
 		}
-
-		worktreePath := worktreePathForBranch(repoPath, worktreeName, config)
 
 		// Run post-create hook if configured
 		if err := runPostCreateHook(worktreePath, config); err != nil {
