@@ -2459,28 +2459,12 @@ func (m model) View() string {
 
 		for i := m.ui.scrollOffset; i < len(m.wt.filtered) && i < m.ui.scrollOffset+viewportHeight; i++ {
 			wt := m.wt.filtered[i]
-			branchColumnWidth := branchDisplayWidth - 1
-			if branchColumnWidth < 1 {
-				branchColumnWidth = 1
-			}
-
 			// Cursor indicator
 			cursor := "  "
 			if i == m.ui.cursor {
 				cursor = "▸ "
 			}
 			pullRequestMarker := renderPullRequestMarker(wt.PRState)
-
-			// Branch name
-			branch := wt.Branch
-			if branch == "" {
-				branch = "(detached)"
-			}
-			if wt.IsCurrent {
-				branch = currentStyle.Render("● " + branch)
-			} else {
-				branch = branchStyle.Render(branch)
-			}
 
 			// Folder mismatch — shown when folder name doesn't match branch
 			isMainWorktree := filepath.Clean(wt.Path) == filepath.Clean(m.mainWorktreeDir)
@@ -2509,6 +2493,29 @@ func (m model) View() string {
 				aheadBehind = " " + strings.Join(parts, " ")
 			}
 
+			statusAndPR := fmt.Sprintf("%s %s", status, pullRequestMarker)
+			branchColumnWidth := branchDisplayWidth
+			if m.ui.width > 0 {
+				// Reserve the cursor and all status symbols before sizing the branch
+				// column. This keeps the PR marker visible even for long branch names.
+				available := m.ui.width - lipgloss.Width(cursor) - lipgloss.Width(" "+statusAndPR+aheadBehind+" ")
+				branchColumnWidth = max(1, min(branchColumnWidth, available))
+			}
+
+			branchText := wt.Branch
+			if branchText == "" {
+				branchText = "(detached)"
+			}
+			if wt.IsCurrent {
+				branchText = "● " + branchText
+			}
+			branchText = truncateToWidth(branchText, branchColumnWidth)
+			branch := branchStyle.Render(branchText)
+			if wt.IsCurrent {
+				branch = currentStyle.Render(branchText)
+			}
+			branch += strings.Repeat(" ", max(0, branchColumnWidth-lipgloss.Width(branchText)))
+
 			// Commit info
 			commitMsg := truncateString(wt.LastCommit.Message, maxCommitMsgLength)
 			relTime := formatRelativeTime(wt.LastCommit.Date)
@@ -2517,36 +2524,26 @@ func (m model) View() string {
 			// Build folder label: "[📂 name]" if it fits, just "[📂]" if tight
 			folderLabel := ""
 			if hasFolderMismatch {
-				tail := fmt.Sprintf(" │ %s%s  ", status, aheadBehind)
-				basePrefix := fmt.Sprintf("%s%-*s%s", cursor, branchColumnWidth, branch, pullRequestMarker)
-				basePrefixWidth := lipgloss.Width(basePrefix) + lipgloss.Width(tail)
-
+				basePrefix := cursor + branch
+				tail := " │ " + statusAndPR + aheadBehind + " "
 				fullLabel := " " + dimStyle.Render("[📂 "+folderName+"]")
+				shortLabel := " " + dimStyle.Render("[📂]")
 				commitWidth := lipgloss.Width(commitText)
-				if m.ui.width <= 0 || basePrefixWidth+lipgloss.Width(fullLabel)+commitWidth <= m.ui.width {
+				if m.ui.width <= 0 || lipgloss.Width(basePrefix)+lipgloss.Width(fullLabel)+lipgloss.Width(tail)+commitWidth <= m.ui.width {
 					folderLabel = fullLabel
-				} else {
-					folderLabel = " " + dimStyle.Render("[📂]")
+				} else if lipgloss.Width(basePrefix)+lipgloss.Width(shortLabel)+lipgloss.Width(tail)+commitWidth <= m.ui.width {
+					folderLabel = shortLabel
 				}
 			}
 
-			// Format line: cursor branch PR [📂 name] │ status ahead/behind  commit
+			// Format line: cursor branch [📂 name] │ status PR ahead/behind  commit
 			var separator string
-			if hasFolderMismatch {
+			if folderLabel != "" {
 				separator = " │ "
 			} else {
 				separator = " "
 			}
-			prefix := fmt.Sprintf("%s%-*s%s%s%s%s%s ",
-				cursor,
-				branchColumnWidth,
-				branch,
-				pullRequestMarker,
-				folderLabel,
-				separator,
-				status,
-				aheadBehind,
-			)
+			prefix := cursor + branch + folderLabel + separator + statusAndPR + aheadBehind + " "
 			maxDetailWidth := 0
 			if m.ui.width > 0 {
 				maxDetailWidth = m.ui.width - lipgloss.Width(prefix)

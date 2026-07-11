@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -515,9 +517,35 @@ func TestWorktreeViewPlacesPullRequestMarkerAfterBranch(t *testing.T) {
 	if branchIndex == -1 || prIndex == -1 || cleanIndex == -1 {
 		t.Fatalf("expected branch, PR marker, and clean status in view:\n%s", view)
 	}
-	if !(branchIndex < prIndex && prIndex < cleanIndex) {
-		t.Fatalf("expected branch, PR marker, then clean status; indexes = %d, %d, %d:\n%s", branchIndex, prIndex, cleanIndex, view)
+	if !(branchIndex < cleanIndex && cleanIndex < prIndex) {
+		t.Fatalf("expected branch, clean status, then PR marker; indexes = %d, %d, %d:\n%s", branchIndex, cleanIndex, prIndex, view)
 	}
+}
+
+func TestWorktreeViewKeepsPRMarkerVisibleForLongBranchAndPath(t *testing.T) {
+	branch := strings.Repeat("feature-", 12)
+	m := model{
+		ui: uiState{width: 32, height: 20},
+		wt: worktreeState{filtered: []Worktree{{
+			Branch:     branch,
+			Path:       "/repo/custom-worktree-folder-with-a-very-long-name",
+			PRState:    pullRequestStateOpen,
+			LastCommit: CommitInfo{Message: "commit"},
+		}}},
+		repoPath:        "/repo",
+		mainWorktreeDir: "/repo",
+	}
+
+	for _, line := range strings.Split(m.View(), "\n") {
+		if !strings.Contains(line, pullRequestSymbol) {
+			continue
+		}
+		if lipgloss.Width(line) > m.ui.width {
+			t.Fatalf("worktree line width = %d, want at most %d:\n%s", lipgloss.Width(line), m.ui.width, line)
+		}
+		return
+	}
+	t.Fatalf("expected PR marker in view:\n%s", m.View())
 }
 
 func TestTruncateToWidth(t *testing.T) {
