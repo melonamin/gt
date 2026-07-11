@@ -423,7 +423,7 @@ func pullRequestStateSymbol(state pullRequestState) string {
 	case pullRequestStatePending:
 		return "?"
 	case pullRequestStateNone:
-		return " "
+		return ""
 	default:
 		return pullRequestSymbol
 	}
@@ -440,8 +440,16 @@ func renderPullRequestMarker(state pullRequestState) string {
 	case pullRequestStateMerged:
 		return pullRequestMergedStyle.Render(pullRequestSymbol)
 	default:
-		return " "
+		return ""
 	}
+}
+
+func renderWorktreeStatus(status string, pullRequestState pullRequestState) string {
+	pullRequestMarker := renderPullRequestMarker(pullRequestState)
+	if pullRequestMarker == "" {
+		return status
+	}
+	return status + " " + pullRequestMarker
 }
 
 func nextPullRequestBackoff(now time.Time, err error) time.Time {
@@ -2486,8 +2494,6 @@ func (m model) View() string {
 			if i == m.ui.cursor {
 				cursor = "▸ "
 			}
-			pullRequestMarker := renderPullRequestMarker(wt.PRState)
-
 			// Folder mismatch — shown when folder name doesn't match branch
 			isMainWorktree := filepath.Clean(wt.Path) == filepath.Clean(m.mainWorktreeDir)
 			hasFolderMismatch := !isMainWorktree && !isExpectedWorktreePath(wt.Branch, wt.Path)
@@ -2515,7 +2521,7 @@ func (m model) View() string {
 				aheadBehind = " " + strings.Join(parts, " ")
 			}
 
-			statusAndPR := fmt.Sprintf("%s %s", status, pullRequestMarker)
+			statusAndPR := renderWorktreeStatus(status, wt.PRState)
 			branchColumnWidth := branchDisplayWidth
 			if m.ui.width > 0 {
 				// Reserve the cursor and all status symbols before sizing the branch

@@ -408,8 +408,8 @@ func TestPullRequestBackoffDecision(t *testing.T) {
 }
 
 func TestPullRequestSymbolRendering(t *testing.T) {
-	if got := pullRequestStateSymbol(pullRequestStateNone); got != " " {
-		t.Fatalf("none symbol = %q, want blank", got)
+	if got := pullRequestStateSymbol(pullRequestStateNone); got != "" {
+		t.Fatalf("none symbol = %q, want empty", got)
 	}
 	if got := pullRequestStateSymbol(pullRequestStatePending); got != "?" {
 		t.Fatalf("pending symbol = %q, want question mark", got)
@@ -425,8 +425,20 @@ func TestPullRequestSymbolRendering(t *testing.T) {
 			t.Fatalf("%s rendered marker = %q, want symbol", state, got)
 		}
 	}
-	if got := renderPullRequestMarker(pullRequestStateNone); got != " " {
-		t.Fatalf("none rendered marker = %q, want blank", got)
+	if got := renderPullRequestMarker(pullRequestStateNone); got != "" {
+		t.Fatalf("none rendered marker = %q, want empty", got)
+	}
+}
+
+func TestRenderWorktreeStatusOmitsMissingPullRequestMarker(t *testing.T) {
+	if got := renderWorktreeStatus("✓", pullRequestStateNone); got != "✓" {
+		t.Fatalf("status without PR = %q, want clean status only", got)
+	}
+	if got := renderWorktreeStatus("✓", pullRequestStatePending); !strings.Contains(got, "?") {
+		t.Fatalf("status while PR is pending = %q, want question mark", got)
+	}
+	if got := renderWorktreeStatus("✓", pullRequestStateOpen); !strings.Contains(got, pullRequestSymbol) {
+		t.Fatalf("status with open PR = %q, want PR symbol", got)
 	}
 }
 
