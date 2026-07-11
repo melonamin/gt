@@ -419,17 +419,6 @@ func pullRequestStateFromGitHub(state string) pullRequestState {
 	}
 }
 
-func pullRequestStateSymbol(state pullRequestState) string {
-	switch state {
-	case pullRequestStatePending:
-		return "?"
-	case pullRequestStateNone:
-		return ""
-	default:
-		return pullRequestSymbol
-	}
-}
-
 func renderPullRequestMarker(state pullRequestState) string {
 	switch state {
 	case pullRequestStatePending:
@@ -1021,10 +1010,13 @@ func fetchWorktreeDetailCmd(wt Worktree, index int, defaultBranch string, genera
 }
 
 func discoverPullRequestLookupsCmd(repoPath string, worktrees []Worktree, generation int) tea.Cmd {
+	// Bubble Tea commands run asynchronously. Keep their input independent from
+	// the model's slice, whose worktree details are updated on the main loop.
+	worktreeSnapshot := append([]Worktree(nil), worktrees...)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
 		defer cancel()
-		lookups, err := loadPullRequestLookups(ctx, repoPath, worktrees)
+		lookups, err := loadPullRequestLookups(ctx, repoPath, worktreeSnapshot)
 		return pullRequestLookupsLoadedMsg{
 			lookups:    lookups,
 			generation: generation,
@@ -1180,19 +1172,45 @@ func (m *model) applyPullRequestStates(states map[string]pullRequestState) {
 	m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
 }
 
-func (m *model) markPullRequestStatesPending(lookups []pullRequestLookup) {
+func pullRequestLookupSetByBranch(lookups []pullRequestLookup) map[string]map[pullRequestLookup]bool {
+	sets := make(map[string]map[pullRequestLookup]bool)
+	for _, lookup := range lookups {
+		if sets[lookup.Branch] == nil {
+			sets[lookup.Branch] = make(map[pullRequestLookup]bool)
+		}
+		sets[lookup.Branch][lookup] = true
+	}
+	return sets
+}
+
+func equalPullRequestLookupSets(a, b map[pullRequestLookup]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for lookup := range a {
+		if !b[lookup] {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *model) reconcilePullRequestStates(lookups []pullRequestLookup) {
 	candidates := make(map[string]bool, len(lookups))
 	for _, lookup := range lookups {
 		candidates[lookup.Branch] = true
 	}
+	oldLookups := pullRequestLookupSetByBranch(m.wt.prLookups)
+	newLookups := pullRequestLookupSetByBranch(lookups)
 	for i := range m.wt.worktrees {
 		wt := &m.wt.worktrees[i]
-		if candidates[wt.Branch] {
-			wt.PRState = pullRequestStatePending
-		} else {
+		if !candidates[wt.Branch] {
 			wt.PRState = pullRequestStateNone
+		} else if !equalPullRequestLookupSets(oldLookups[wt.Branch], newLookups[wt.Branch]) {
+			wt.PRState = pullRequestStatePending
 		}
 	}
+	m.wt.prLookups = lookups
 	m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
 }
 
@@ -1568,13 +1586,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setErrorStatus(fmt.Sprintf("Load failed: %v", msg.err), statusMessageTimeout)
 			return m, tickCmd()
 		}
+		previousStates := make(map[string]pullRequestState, len(m.wt.worktrees))
+		for _, wt := range m.wt.worktrees {
+			previousStates[wt.Branch] = wt.PRState
+		}
 		m.wt.worktrees = msg.worktrees
+		for i := range m.wt.worktrees {
+			if state, ok := previousStates[m.wt.worktrees[i].Branch]; ok {
+				m.wt.worktrees[i].PRState = state
+			}
+		}
+		m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
 		m.wt.defaultBranch = msg.defaultBranch
 		m.mainWorktreeDir = msg.mainWorktreeDir
 		m.wt.detailGeneration++
 		m.wt.prGeneration++
 		m.wt.prFetchAttempts = 0
-		m.wt.prLookups = nil
 		m.resetDetailQueue()
 		// Find current worktree path for tracking previous (session-only)
 		if m.wt.previousWorktree == "" {
@@ -1589,7 +1616,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if detailCmd := m.startDetailFetches(); detailCmd != nil {
 			cmds = append(cmds, detailCmd)
 		}
-		cmds = append(cmds, discoverPullRequestLookupsCmd(m.repoPath, msg.worktrees, m.wt.prGeneration))
+		cmds = append(cmds, discoverPullRequestLookupsCmd(m.repoPath, m.wt.worktrees, m.wt.prGeneration))
 		return m, tea.Batch(cmds...)
 
 	case worktreeDetailLoadedMsg:
@@ -1614,8 +1641,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// local repository cannot be inspected for GitHub candidates.
 			return m, tickCmd()
 		}
-		m.wt.prLookups = msg.lookups
-		m.markPullRequestStatesPending(msg.lookups)
+		m.reconcilePullRequestStates(msg.lookups)
 		if pullRequestCmd := m.startPullRequestFetch(); pullRequestCmd != nil {
 			return m, tea.Batch(tickCmd(), pullRequestCmd)
 		}
@@ -1926,19 +1952,47 @@ func mapPullRequestStates(lookups []pullRequestLookup, response githubPullReques
 	return states
 }
 
-func branchUpstream(ctx context.Context, repoPath, branch string) (remote, headRef string, ok bool) {
-	remoteOutput, err := runGitCmd(ctx, repoPath, "config", "--get", fmt.Sprintf("branch.%s.remote", branch))
+type branchUpstreamConfig struct {
+	remote  string
+	headRef string
+}
+
+func branchUpstreams(ctx context.Context, repoPath string) map[string]branchUpstreamConfig {
+	output, err := runGitCmd(ctx, repoPath, "config", "--get-regexp", `^branch\..*\.(remote|merge)$`)
 	if err != nil {
-		return "", "", false
-	}
-	mergeOutput, err := runGitCmd(ctx, repoPath, "config", "--get", fmt.Sprintf("branch.%s.merge", branch))
-	if err != nil {
-		return "", "", false
+		return nil
 	}
 
-	remote = strings.TrimSpace(string(remoteOutput))
-	headRef = strings.TrimPrefix(strings.TrimSpace(string(mergeOutput)), "refs/heads/")
-	return remote, headRef, remote != "" && headRef != ""
+	upstreams := make(map[string]branchUpstreamConfig)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		key, value := fields[0], fields[1]
+		if !strings.HasPrefix(key, "branch.") {
+			continue
+		}
+
+		var branch string
+		config := branchUpstreamConfig{}
+		switch {
+		case strings.HasSuffix(key, ".remote"):
+			branch = strings.TrimSuffix(strings.TrimPrefix(key, "branch."), ".remote")
+			config = upstreams[branch]
+			config.remote = value
+		case strings.HasSuffix(key, ".merge"):
+			branch = strings.TrimSuffix(strings.TrimPrefix(key, "branch."), ".merge")
+			config = upstreams[branch]
+			config.headRef = strings.TrimPrefix(value, "refs/heads/")
+		default:
+			continue
+		}
+		if branch != "" {
+			upstreams[branch] = config
+		}
+	}
+	return upstreams
 }
 
 func githubRepoForRemote(remotes []gitRemote, remoteName string) (githubRepo, bool) {
@@ -1968,17 +2022,18 @@ func uniquePullRequestLookups(ctx context.Context, repoPath string, worktrees []
 	seen := make(map[string]bool)
 	unique := make([]pullRequestLookup, 0, len(worktrees))
 	fallbackRepos := githubReposForRemotes(remotes)
+	upstreams := branchUpstreams(ctx, repoPath)
 	for _, wt := range worktrees {
 		branch := strings.TrimSpace(wt.Branch)
 		head := strings.TrimSpace(wt.Head)
 		if branch == "" || head == "" {
 			continue
 		}
-		if remote, upstreamBranch, ok := branchUpstream(ctx, repoPath, branch); ok {
-			if upstreamRepo, ok := githubRepoForRemote(remotes, remote); ok {
+		if upstream := upstreams[branch]; upstream.remote != "" && upstream.headRef != "" {
+			if upstreamRepo, ok := githubRepoForRemote(remotes, upstream.remote); ok {
 				lookup := pullRequestLookup{
 					Branch:    branch,
-					HeadRef:   upstreamBranch,
+					HeadRef:   upstream.headRef,
 					HeadOwner: strings.ToLower(upstreamRepo.Owner),
 					HeadRepo:  upstreamRepo,
 				}
@@ -1994,11 +2049,10 @@ func uniquePullRequestLookups(ctx context.Context, repoPath string, worktrees []
 			lookup := pullRequestLookup{
 				Branch:    branch,
 				HeadRef:   branch,
-				Head:      head,
 				HeadOwner: strings.ToLower(fallbackRepo.Owner),
 				HeadRepo:  fallbackRepo,
 			}
-			key := fmt.Sprintf("%s\x00%s\x00%s\x00%s/%s", lookup.Branch, lookup.HeadRef, lookup.Head, lookup.HeadRepo.Owner, lookup.HeadRepo.Name)
+			key := fmt.Sprintf("%s\x00%s\x00%s/%s", lookup.Branch, lookup.HeadRef, lookup.HeadRepo.Owner, lookup.HeadRepo.Name)
 			if seen[key] {
 				continue
 			}
@@ -2013,15 +2067,15 @@ func buildPullRequestGraphQLQuery(lookups []pullRequestLookup) string {
 	var b strings.Builder
 	b.WriteString("query {\n")
 	for i, lookup := range lookups {
-		b.WriteString(fmt.Sprintf("  %s: repository(owner: %s, name: %s) {\n", githubPullRequestRepositoryAlias(i), strconv.Quote(lookup.HeadRepo.Owner), strconv.Quote(lookup.HeadRepo.Name)))
-		b.WriteString(fmt.Sprintf(
+		fmt.Fprintf(&b, "  %s: repository(owner: %s, name: %s) {\n", githubPullRequestRepositoryAlias(i), strconv.Quote(lookup.HeadRepo.Owner), strconv.Quote(lookup.HeadRepo.Name))
+		fmt.Fprintf(&b,
 			"    pullRequests(first: 10, headRefName: %s, states: [OPEN, CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { state headRefOid headRepositoryOwner { login } } }\n",
 			strconv.Quote(lookup.HeadRef),
-		))
-		b.WriteString(fmt.Sprintf(
+		)
+		fmt.Fprintf(&b,
 			"    parent { pullRequests(first: 10, headRefName: %s, states: [OPEN, CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { nodes { state headRefOid headRepositoryOwner { login } } } }\n",
 			strconv.Quote(lookup.HeadRef),
-		))
+		)
 		b.WriteString("  }\n")
 	}
 	b.WriteString("}\n")
@@ -2069,7 +2123,7 @@ func fetchPullRequestStates(ctx context.Context, client *http.Client, endpoint, 
 			continue
 		}
 		func() {
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				err = fmt.Errorf("github graphql returned status %d", resp.StatusCode)
 				fetchErrors = append(fetchErrors, err)
@@ -2634,6 +2688,7 @@ func (m model) View() string {
 			}
 
 			statusAndPR := renderWorktreeStatus(status, wt.PRState)
+			// Branch name
 			branchText := wt.Branch
 			if branchText == "" {
 				branchText = "(detached)"
@@ -2642,11 +2697,18 @@ func (m model) View() string {
 				branchText = "● " + branchText
 			}
 
+			shortFolderLabel := ""
+			branchSuffix := " " + statusAndPR + aheadBehind + " "
+			if hasFolderMismatch {
+				shortFolderLabel = " " + dimStyle.Render("[📂]")
+				branchSuffix = shortFolderLabel + " │ " + statusAndPR + aheadBehind + " "
+			}
+
 			branchColumnWidth := max(branchDisplayWidth, lipgloss.Width(branchText))
 			if m.ui.width > 0 {
-				// Reserve the cursor and all status symbols before sizing the branch
-				// column. This keeps the PR marker visible even for long branch names.
-				available := m.ui.width - lipgloss.Width(cursor) - lipgloss.Width(" "+statusAndPR+aheadBehind+" ")
+				// Reserve the cursor, folder cue, and status symbols before sizing the
+				// branch column. These cues stay visible even for long branch names.
+				available := m.ui.width - lipgloss.Width(cursor) - lipgloss.Width(branchSuffix)
 				branchColumnWidth = max(1, min(branchColumnWidth, available))
 			}
 
@@ -2665,15 +2727,13 @@ func (m model) View() string {
 			// Build folder label: "[📂 name]" if it fits, just "[📂]" if tight
 			folderLabel := ""
 			if hasFolderMismatch {
+				folderLabel = shortFolderLabel
 				basePrefix := cursor + branch
 				tail := " │ " + statusAndPR + aheadBehind + " "
 				fullLabel := " " + dimStyle.Render("[📂 "+folderName+"]")
-				shortLabel := " " + dimStyle.Render("[📂]")
 				commitWidth := lipgloss.Width(commitText)
 				if m.ui.width <= 0 || lipgloss.Width(basePrefix)+lipgloss.Width(fullLabel)+lipgloss.Width(tail)+commitWidth <= m.ui.width {
 					folderLabel = fullLabel
-				} else if lipgloss.Width(basePrefix)+lipgloss.Width(shortLabel)+lipgloss.Width(tail)+commitWidth <= m.ui.width {
-					folderLabel = shortLabel
 				}
 			}
 

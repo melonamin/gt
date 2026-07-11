@@ -259,6 +259,33 @@ func TestUniquePullRequestLookupsUsesConfiguredRemoteIdentity(t *testing.T) {
 	}
 }
 
+func TestUniquePullRequestLookupsDoesNotRequireFallbackHeadMatch(t *testing.T) {
+	repoPath := initRepo(t)
+	remote := gitRemote{Name: "origin", URL: "https://github.com/fishy/gt.git"}
+
+	lookups := uniquePullRequestLookups(
+		context.Background(),
+		repoPath,
+		[]Worktree{{Branch: "feature", Head: "local-diverged-sha"}},
+		[]gitRemote{remote},
+	)
+
+	if len(lookups) != 1 {
+		t.Fatalf("got %d lookups, want 1", len(lookups))
+	}
+	if lookups[0].Head != "" {
+		t.Fatalf("fallback head = %q, want empty so local commits do not hide the PR", lookups[0].Head)
+	}
+	response := githubPullRequestGraphQLResponse{Data: map[string]*githubPullRequestRepository{
+		"repo0": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{
+			pullRequestNode("OPEN", "remote-pr-sha", "fishy"),
+		}}},
+	}}
+	if got := mapPullRequestStates(lookups, response)["feature"]; got != pullRequestStateOpen {
+		t.Fatalf("state = %q, want %q for diverged local branch", got, pullRequestStateOpen)
+	}
+}
+
 func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T) {
 	repoPath := initRepo(t)
 	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/fishy/gt.git")
@@ -404,6 +431,59 @@ func TestDefaultTokenLookupPrefersEnvironment(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestLookupsCmdSnapshotsWorktrees(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/fishy/gt.git")
+	worktrees := []Worktree{{Branch: "feature", Head: "abc123"}}
+
+	cmd := discoverPullRequestLookupsCmd(repoPath, worktrees, 7)
+	worktrees[0].Branch = "mutated-after-command-start"
+	msg := cmd().(pullRequestLookupsLoadedMsg)
+
+	if msg.err != nil {
+		t.Fatalf("discover lookups: %v", msg.err)
+	}
+	if msg.generation != 7 || len(msg.lookups) != 1 || msg.lookups[0].Branch != "feature" {
+		t.Fatalf("message = %#v, want immutable feature snapshot", msg)
+	}
+}
+
+func TestWorktreesLoadedRebuildsFilteredAndPreservesPullRequestState(t *testing.T) {
+	oldLookup := pullRequestLookup{
+		Branch: "kept", HeadRef: "kept", HeadOwner: "fishy",
+		HeadRepo: githubRepo{Owner: "fishy", Name: "gt"},
+	}
+	m := model{
+		repoPath: "/repo",
+		wt: worktreeState{
+			worktrees: []Worktree{
+				{Branch: "deleted"},
+				{Branch: "kept", PRState: pullRequestStateOpen},
+			},
+			filtered:  []Worktree{{Branch: "deleted"}},
+			prLookups: []pullRequestLookup{oldLookup},
+		},
+	}
+
+	updated, _ := m.Update(worktreesLoadedMsg{worktrees: []Worktree{{Branch: "kept", Head: "abc123"}}})
+	m = updated.(model)
+	if len(m.wt.filtered) != 1 || m.wt.filtered[0].Branch != "kept" {
+		t.Fatalf("filtered = %#v, want only refreshed worktree", m.wt.filtered)
+	}
+	if got := m.wt.filtered[0].PRState; got != pullRequestStateOpen {
+		t.Fatalf("preserved PR state = %q, want %q", got, pullRequestStateOpen)
+	}
+
+	updated, _ = m.Update(pullRequestLookupsLoadedMsg{lookups: []pullRequestLookup{oldLookup}, generation: m.wt.prGeneration})
+	m = updated.(model)
+	if got := m.wt.worktrees[0].PRState; got != pullRequestStateOpen {
+		t.Fatalf("reconciled PR state = %q, want cached %q", got, pullRequestStateOpen)
+	}
+	if m.wt.prFetchAttempts != 0 {
+		t.Fatalf("fetch attempts = %d, want no refetch for unchanged lookup", m.wt.prFetchAttempts)
+	}
+}
+
 func TestPullRequestFetchRetriesOnlyOnce(t *testing.T) {
 	m := model{
 		repoPath: "/repo",
@@ -432,20 +512,11 @@ func TestPullRequestFetchRetriesOnlyOnce(t *testing.T) {
 	}
 }
 
-func TestPullRequestSymbolRendering(t *testing.T) {
-	if got := pullRequestStateSymbol(pullRequestStateNone); got != "" {
-		t.Fatalf("none symbol = %q, want empty", got)
-	}
-	if got := pullRequestStateSymbol(pullRequestStatePending); got != "?" {
-		t.Fatalf("pending symbol = %q, want question mark", got)
-	}
+func TestPullRequestMarkerRendering(t *testing.T) {
 	if got := renderPullRequestMarker(pullRequestStatePending); !strings.Contains(got, "?") {
 		t.Fatalf("pending marker = %q, want question mark", got)
 	}
 	for _, state := range []pullRequestState{pullRequestStateOpen, pullRequestStateClosed, pullRequestStateMerged} {
-		if got := pullRequestStateSymbol(state); got != pullRequestSymbol {
-			t.Fatalf("%s symbol = %q, want %q", state, got, pullRequestSymbol)
-		}
 		if got := renderPullRequestMarker(state); !strings.Contains(got, pullRequestSymbol) {
 			t.Fatalf("%s rendered marker = %q, want symbol", state, got)
 		}
@@ -482,13 +553,13 @@ func TestApplyPullRequestStatesLeavesUnresolvedStatePending(t *testing.T) {
 	}
 }
 
-func TestMarkPullRequestStatesPendingOnlyForLookupCandidates(t *testing.T) {
+func TestReconcilePullRequestStatesMarksOnlyNewLookupCandidatesPending(t *testing.T) {
 	m := model{wt: worktreeState{worktrees: []Worktree{
 		{Branch: "feature", Head: "abc123"},
 		{Branch: "detached"},
 	}}}
 
-	m.markPullRequestStatesPending([]pullRequestLookup{{Branch: "feature"}})
+	m.reconcilePullRequestStates([]pullRequestLookup{{Branch: "feature"}})
 	if got := m.wt.worktrees[0].PRState; got != pullRequestStatePending {
 		t.Fatalf("feature state = %q, want %q", got, pullRequestStatePending)
 	}
@@ -517,7 +588,7 @@ func TestWorktreeViewPlacesPullRequestMarkerAfterBranch(t *testing.T) {
 	if branchIndex == -1 || prIndex == -1 || cleanIndex == -1 {
 		t.Fatalf("expected branch, PR marker, and clean status in view:\n%s", view)
 	}
-	if !(branchIndex < cleanIndex && cleanIndex < prIndex) {
+	if branchIndex >= cleanIndex || cleanIndex >= prIndex {
 		t.Fatalf("expected branch, clean status, then PR marker; indexes = %d, %d, %d:\n%s", branchIndex, cleanIndex, prIndex, view)
 	}
 }
@@ -539,6 +610,9 @@ func TestWorktreeViewKeepsPRMarkerVisibleForLongBranchAndPath(t *testing.T) {
 	for _, line := range strings.Split(m.View(), "\n") {
 		if !strings.Contains(line, pullRequestSymbol) {
 			continue
+		}
+		if !strings.Contains(line, "[📂]") {
+			t.Fatalf("worktree line dropped folder mismatch marker:\n%s", line)
 		}
 		if lipgloss.Width(line) > m.ui.width {
 			t.Fatalf("worktree line width = %d, want at most %d:\n%s", lipgloss.Width(line), m.ui.width, line)
