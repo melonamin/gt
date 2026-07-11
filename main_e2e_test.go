@@ -106,6 +106,66 @@ func TestGTRunFromLinkedWorktreeUsesMainRelativeWorktreeDir(t *testing.T) {
 	}
 }
 
+func TestGTRunFromSeparateGitDirUsesCheckoutRelativeWorktreeDir(t *testing.T) {
+	parentDir := t.TempDir()
+	repoPath := filepath.Join(parentDir, "checkout")
+	gitDir := filepath.Join(parentDir, "metadata", ".git")
+	if err := os.MkdirAll(filepath.Dir(gitDir), 0755); err != nil {
+		t.Fatalf("create metadata directory: %v", err)
+	}
+
+	runGit(t, parentDir, "init", "--separate-git-dir="+gitDir, "--initial-branch=master", repoPath)
+	readmePath := filepath.Join(repoPath, "README.md")
+	if err := os.WriteFile(readmePath, []byte("test"), 0644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoPath, "add", "README.md")
+	runGit(t, repoPath, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	binaryPath := buildBinary(t)
+	cmd := exec.Command(binaryPath, "-x", "true", "feature-branch")
+	cmd.Dir = repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gt run failed: %v\n%s", err, output)
+	}
+
+	worktreePath := filepath.Join(repoPath, defaultWorktreeDir, "feature-branch")
+	if _, err := os.Stat(worktreePath); err != nil {
+		t.Fatalf("expected worktree to exist in checkout-relative path: %v", err)
+	}
+}
+
+func TestGTRunRejectsRepositoryRootWorktreeDir(t *testing.T) {
+	repoPath := initRepo(t)
+	binaryPath := buildBinary(t)
+	configDir := filepath.Join(t.TempDir(), "gt")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create config dir: %v", err)
+	}
+
+	configPath := filepath.Join(configDir, "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"worktree_dir":"."}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cmd := exec.Command(binaryPath, "-x", "true", "feature-branch")
+	cmd.Dir = repoPath
+	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Dir(configDir))
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected gt to reject repository-root worktree directory, got success:\n%s", output)
+	}
+	if !strings.Contains(string(output), "worktree directory must not be the repository root") {
+		t.Fatalf("expected repository-root worktree directory error, got:\n%s", output)
+	}
+
+	branchOutput := runGit(t, repoPath, "branch", "--list", "feature-branch")
+	if strings.TrimSpace(string(branchOutput)) != "" {
+		t.Fatalf("expected feature branch not to be created, got %q", branchOutput)
+	}
+}
+
 func TestGTRunCreatesWorktreeFromRemoteBranch(t *testing.T) {
 	seedPath := initRepo(t)
 	binaryPath := buildBinary(t)
