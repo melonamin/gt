@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -197,7 +197,7 @@ func TestParseGitHubRemoteURL(t *testing.T) {
 
 func TestMapPullRequestStates(t *testing.T) {
 	var response githubPullRequestGraphQLResponse
-	response.Data.Repository = map[string]githubPullRequestRepository{
+	response.Data.Repository = map[string]*githubPullRequestRepository{
 		"repo0": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("OPEN", "aaa", "fishy")}}},
 		"repo1": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("CLOSED", "bbb", "fishy")}}},
 		"repo2": {Parent: &githubPullRequestRepository{PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{pullRequestNode("MERGED", "ccc", "melonamin")}}}},
@@ -306,7 +306,7 @@ func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T)
 
 func TestMapPullRequestStatesRequiresHeadAndOwnerMatch(t *testing.T) {
 	var response githubPullRequestGraphQLResponse
-	response.Data.Repository = map[string]githubPullRequestRepository{
+	response.Data.Repository = map[string]*githubPullRequestRepository{
 		"repo0": {PullRequests: githubPullRequestConnection{Nodes: []githubPullRequestNode{
 			pullRequestNode("MERGED", "old-sha", "fishy"),
 			pullRequestNode("OPEN", "current-sha", "someone-else"),
@@ -350,7 +350,7 @@ func TestBuildPullRequestGraphQLQueryIncludesForkParentAndHeadQualifiers(t *test
 	}
 }
 
-func TestLoadPullRequestStatesAllowsTokenWithoutGHBinary(t *testing.T) {
+func TestLoadPullRequestStatesUsesProvidedTokenLookupWithoutGHBinary(t *testing.T) {
 	repoPath := initRepo(t)
 	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/melonamin/gt.git")
 
@@ -394,16 +394,38 @@ func TestLoadPullRequestStatesAllowsTokenWithoutGHBinary(t *testing.T) {
 	}
 }
 
-func TestPullRequestBackoffDecision(t *testing.T) {
-	now := time.Unix(100, 0)
-	if got := nextPullRequestBackoff(now, nil); !got.IsZero() {
-		t.Fatalf("nil error backoff = %v, want zero", got)
+func TestDefaultTokenLookupPrefersEnvironment(t *testing.T) {
+	t.Setenv("GH_TOKEN", "token-from-env")
+	t.Setenv("GITHUB_TOKEN", "")
+
+	token, _ := defaultTokenLookup("github.com")
+	if token != "token-from-env" {
+		t.Fatalf("token = %q, want GH_TOKEN value", token)
+	}
+}
+
+func TestPullRequestFetchRetriesOnlyOnce(t *testing.T) {
+	m := model{
+		repoPath: "/repo",
+		wt: worktreeState{
+			prGeneration:    1,
+			prFetchAttempts: 1,
+			worktrees:       []Worktree{{Branch: "feature", Head: "abc123"}},
+		},
 	}
 
-	got := nextPullRequestBackoff(now, errors.New("failed"))
-	want := now.Add(githubPRBackoff)
-	if !got.Equal(want) {
-		t.Fatalf("backoff = %v, want %v", got, want)
+	updated, cmd := m.Update(pullRequestsLoadedMsg{generation: 1, err: fmt.Errorf("temporary failure")})
+	if cmd == nil {
+		t.Fatal("expected retry command after the first failure")
+	}
+	m = updated.(model)
+	if got := m.wt.prFetchAttempts; got != 2 {
+		t.Fatalf("attempts after retry = %d, want 2", got)
+	}
+	updated, _ = m.Update(pullRequestsLoadedMsg{generation: 1, err: fmt.Errorf("temporary failure")})
+	m = updated.(model)
+	if got := m.wt.prFetchAttempts; got != 2 {
+		t.Fatalf("attempts after second failure = %d, want no third attempt", got)
 	}
 }
 
@@ -521,6 +543,48 @@ func TestWorktreeViewKeepsPRMarkerVisibleForLongBranchAndPath(t *testing.T) {
 		return
 	}
 	t.Fatalf("expected PR marker in view:\n%s", m.View())
+}
+
+func TestWorktreeViewDoesNotTruncateBranchWhenThereIsRoom(t *testing.T) {
+	branch := strings.Repeat("feature-", 8)
+	m := model{
+		ui: uiState{width: 160, height: 20},
+		wt: worktreeState{filtered: []Worktree{{
+			Branch:     branch,
+			Path:       "/repo/.worktrees/feature",
+			PRState:    pullRequestStateOpen,
+			LastCommit: CommitInfo{Message: "commit"},
+		}}},
+		repoPath:        "/repo",
+		mainWorktreeDir: "/repo",
+	}
+
+	if view := m.View(); !strings.Contains(view, branch) {
+		t.Fatalf("wide view truncated branch %q:\n%s", branch, view)
+	}
+}
+
+func TestFetchPullRequestStatesUsesPartialGraphQLData(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"data":{"repository":{"repo0":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"fishy"}}]},"parent":null},"repo1":null}},"errors":[{"message":"repository not found"}]}`
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+
+	states, err := fetchPullRequestStates(context.Background(), client, githubGraphQLEndpoint, "token", []pullRequestLookup{
+		{Branch: "feature", Head: "abc123", HeadOwner: "fishy", HeadRepo: githubRepo{Owner: "fishy", Name: "gt"}},
+		{Branch: "other", Head: "def456", HeadOwner: "missing", HeadRepo: githubRepo{Owner: "missing", Name: "gt"}},
+	})
+	if err != nil {
+		t.Fatalf("fetch pull request states: %v", err)
+	}
+	if got := states["feature"]; got != pullRequestStateOpen {
+		t.Fatalf("feature state = %q, want %q", got, pullRequestStateOpen)
+	}
 }
 
 func TestTruncateToWidth(t *testing.T) {

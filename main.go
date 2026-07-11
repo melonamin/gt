@@ -19,7 +19,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/cli/go-gh/v2/pkg/auth"
 )
 
 const (
@@ -43,13 +42,13 @@ const (
 	gitCmdSlowTimeout = 10 * time.Second
 
 	// Internal throttling/timeouts
-	maxDetailFetchWorkers = 4
-	worktreeDetailTimeout = 30 * time.Second
-	worktreeCmdTimeout    = 2 * time.Minute
-	githubPRBackoff       = 5 * time.Minute
-	githubPRBatchSize     = 25
-	githubGraphQLEndpoint = "https://api.github.com/graphql"
-	pullRequestSymbol     = "⎇"
+	maxDetailFetchWorkers       = 4
+	worktreeDetailTimeout       = 30 * time.Second
+	worktreeCmdTimeout          = 2 * time.Minute
+	maxPullRequestFetchAttempts = 2
+	githubPRBatchSize           = 25
+	githubGraphQLEndpoint       = "https://api.github.com/graphql"
+	pullRequestSymbol           = "⎇"
 )
 
 // Config holds user configuration loaded from ~/.config/gt/config.json.
@@ -130,7 +129,22 @@ type pullRequestLookup struct {
 type tokenLookupFunc func(host string) (token, source string)
 
 func defaultTokenLookup(host string) (string, string) {
-	return auth.TokenForHost(host)
+	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
+		if token := strings.TrimSpace(os.Getenv(name)); token != "" {
+			return token, name
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), gitCmdTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "gh", "auth", "token", "--hostname", host).Output()
+	if err != nil {
+		return "", ""
+	}
+	if token := strings.TrimSpace(string(output)); token != "" {
+		return token, "gh"
+	}
+	return "", ""
 }
 
 // inputMode represents the current input state of the TUI.
@@ -181,7 +195,7 @@ type worktreeState struct {
 	activeDetailFetches int
 	detailGeneration    int
 	prGeneration        int
-	prBackoffUntil      time.Time
+	prFetchAttempts     int
 }
 
 // actionsState holds the state for the actions menu.
@@ -450,13 +464,6 @@ func renderWorktreeStatus(status string, pullRequestState pullRequestState) stri
 		return status
 	}
 	return status + " " + pullRequestMarker
-}
-
-func nextPullRequestBackoff(now time.Time, err error) time.Time {
-	if err == nil {
-		return time.Time{}
-	}
-	return now.Add(githubPRBackoff)
 }
 
 func getConfigPath() string {
@@ -1123,7 +1130,7 @@ func (m *model) startDetailFetches() tea.Cmd {
 }
 
 func (m *model) startPullRequestFetch() tea.Cmd {
-	if time.Now().Before(m.wt.prBackoffUntil) {
+	if m.wt.prFetchAttempts >= maxPullRequestFetchAttempts {
 		return nil
 	}
 	worktrees := make([]Worktree, 0, len(m.wt.worktrees))
@@ -1138,6 +1145,7 @@ func (m *model) startPullRequestFetch() tea.Cmd {
 	if len(worktrees) == 0 {
 		return nil
 	}
+	m.wt.prFetchAttempts++
 	return fetchPullRequestsCmd(m.repoPath, worktrees, m.wt.prGeneration)
 }
 
@@ -1555,6 +1563,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mainWorktreeDir = msg.mainWorktreeDir
 		m.wt.detailGeneration++
 		m.wt.prGeneration++
+		m.wt.prFetchAttempts = 0
 		m.markPullRequestStatesPending()
 		m.resetDetailQueue()
 		// Find current worktree path for tracking previous (session-only)
@@ -1593,10 +1602,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickCmd()
 		}
 		if msg.err != nil {
-			m.wt.prBackoffUntil = nextPullRequestBackoff(time.Now(), msg.err)
+			if retryCmd := m.startPullRequestFetch(); retryCmd != nil {
+				return m, tea.Batch(tickCmd(), retryCmd)
+			}
 			return m, tickCmd()
 		}
-		m.wt.prBackoffUntil = time.Time{}
 		m.applyPullRequestStates(msg.states)
 		return m, tickCmd()
 
@@ -1835,7 +1845,7 @@ type githubPullRequestRepository struct {
 
 type githubPullRequestGraphQLResponse struct {
 	Data struct {
-		Repository map[string]githubPullRequestRepository `json:"repository"`
+		Repository map[string]*githubPullRequestRepository `json:"repository"`
 	} `json:"data"`
 	Errors []struct {
 		Message string `json:"message"`
@@ -1864,7 +1874,7 @@ func mapPullRequestStates(lookups []pullRequestLookup, response githubPullReques
 			continue
 		}
 		repo, ok := response.Data.Repository[githubPullRequestRepositoryAlias(i)]
-		if !ok {
+		if !ok || repo == nil {
 			continue
 		}
 		connections := []githubPullRequestConnection{repo.PullRequests}
@@ -2037,12 +2047,18 @@ func fetchPullRequestStates(ctx context.Context, client *http.Client, endpoint, 
 				err = decodeErr
 				return
 			}
-			if len(graphQLResp.Errors) > 0 {
-				err = fmt.Errorf("github graphql error: %s", graphQLResp.Errors[0].Message)
-				return
+			usableResponse := false
+			for _, repository := range graphQLResp.Data.Repository {
+				if repository != nil {
+					usableResponse = true
+					break
+				}
 			}
 			for branch, state := range mapPullRequestStates(batch, graphQLResp) {
 				states[branch] = state
+			}
+			if len(graphQLResp.Errors) > 0 && !usableResponse {
+				err = fmt.Errorf("github graphql error: %s", graphQLResp.Errors[0].Message)
 			}
 		}()
 		if err != nil {
@@ -2522,14 +2538,6 @@ func (m model) View() string {
 			}
 
 			statusAndPR := renderWorktreeStatus(status, wt.PRState)
-			branchColumnWidth := branchDisplayWidth
-			if m.ui.width > 0 {
-				// Reserve the cursor and all status symbols before sizing the branch
-				// column. This keeps the PR marker visible even for long branch names.
-				available := m.ui.width - lipgloss.Width(cursor) - lipgloss.Width(" "+statusAndPR+aheadBehind+" ")
-				branchColumnWidth = max(1, min(branchColumnWidth, available))
-			}
-
 			branchText := wt.Branch
 			if branchText == "" {
 				branchText = "(detached)"
@@ -2537,6 +2545,15 @@ func (m model) View() string {
 			if wt.IsCurrent {
 				branchText = "● " + branchText
 			}
+
+			branchColumnWidth := max(branchDisplayWidth, lipgloss.Width(branchText))
+			if m.ui.width > 0 {
+				// Reserve the cursor and all status symbols before sizing the branch
+				// column. This keeps the PR marker visible even for long branch names.
+				available := m.ui.width - lipgloss.Width(cursor) - lipgloss.Width(" "+statusAndPR+aheadBehind+" ")
+				branchColumnWidth = max(1, min(branchColumnWidth, available))
+			}
+
 			branchText = truncateToWidth(branchText, branchColumnWidth)
 			branch := branchStyle.Render(branchText)
 			if wt.IsCurrent {
