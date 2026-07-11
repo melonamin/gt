@@ -106,6 +106,50 @@ func TestGTRunFromLinkedWorktreeUsesMainRelativeWorktreeDir(t *testing.T) {
 	}
 }
 
+func TestGTRunPostCreateHookUsesCreatedWorktreePath(t *testing.T) {
+	repoPath := initRepo(t)
+	binaryPath := buildBinary(t)
+	configHome := t.TempDir()
+	hookPathFile := filepath.Join(t.TempDir(), "hook-path")
+
+	configDir := filepath.Join(configHome, "gt")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	configPath := filepath.Join(configDir, "config.json")
+	configData := `{"shell":"/bin/sh","post_create":"pwd > \"$GT_HOOK_CWD\""}`
+	if err := os.WriteFile(configPath, []byte(configData), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	linkedWorktreePath := filepath.Join(repoPath, defaultWorktreeDir, "source")
+	runGit(t, repoPath, "worktree", "add", "-b", "source", linkedWorktreePath)
+
+	cmd := exec.Command(binaryPath, "-x", "true", "feature-branch")
+	cmd.Dir = linkedWorktreePath
+	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "GT_HOOK_CWD="+hookPathFile)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gt run failed: %v\n%s", err, output)
+	}
+
+	hookPath, err := os.ReadFile(hookPathFile)
+	if err != nil {
+		t.Fatalf("read hook path: %v", err)
+	}
+	gotPath, err := filepath.EvalSymlinks(strings.TrimSpace(string(hookPath)))
+	if err != nil {
+		t.Fatalf("resolve hook path: %v", err)
+	}
+	wantPath, err := filepath.EvalSymlinks(filepath.Join(repoPath, defaultWorktreeDir, "feature-branch"))
+	if err != nil {
+		t.Fatalf("resolve expected worktree path: %v", err)
+	}
+	if string(gotPath) != wantPath {
+		t.Errorf("post-create hook ran in %q, want %q", gotPath, wantPath)
+	}
+}
+
 func TestGTRunFromSeparateGitDirUsesCheckoutRelativeWorktreeDir(t *testing.T) {
 	parentDir := t.TempDir()
 	repoPath := filepath.Join(parentDir, "checkout")
