@@ -370,109 +370,38 @@ func getCurrentRepoPath() (string, error) {
 }
 
 func getMainWorktreePath(repoPath string) (string, bool) {
-	output, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "rev-parse", "--is-bare-repository")
-	if err != nil || strings.TrimSpace(string(output)) == "true" {
-		return "", false
-	}
-
-	output, err = runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "rev-parse", "--is-inside-work-tree")
-	if err != nil || strings.TrimSpace(string(output)) != "true" {
-		return "", false
-	}
-
-	output, err = runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "rev-parse", "--show-superproject-working-tree")
-	if err != nil || strings.TrimSpace(string(output)) != "" {
-		return "", false
-	}
-
-	output, err = runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	output, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "worktree", "list", "--porcelain")
 	if err != nil {
 		return "", false
 	}
 
-	commonDir := filepath.Clean(strings.TrimSpace(string(output)))
-	if filepath.Base(commonDir) != ".git" {
-		return "", false
-	}
-	if info, err := os.Stat(commonDir); err != nil || !info.IsDir() {
-		return "", false
-	}
-
-	output, err = runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "rev-parse", "--path-format=absolute", "--git-dir")
-	if err != nil {
-		return "", false
-	}
-	gitDir := filepath.Clean(strings.TrimSpace(string(output)))
-	resolvedGitDir, err := filepath.EvalSymlinks(gitDir)
-	if err != nil {
-		return "", false
-	}
-	resolvedCommonDir, err := filepath.EvalSymlinks(commonDir)
-	if err != nil {
-		return "", false
-	}
-	if resolvedGitDir == resolvedCommonDir {
-		return repoPath, true
-	}
-
-	output, err = runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "worktree", "list", "--porcelain")
-	if err != nil {
-		return "", false
-	}
-
-	var listedMainWorktreePath string
+	var mainWorktreePath string
 	for _, line := range strings.Split(string(output), "\n") {
 		if path, found := strings.CutPrefix(line, "worktree "); found {
-			listedMainWorktreePath = filepath.Clean(path)
+			mainWorktreePath = filepath.Clean(path)
 			break
 		}
 	}
-	if listedMainWorktreePath == "" {
+	if mainWorktreePath == "" {
 		return "", false
 	}
 
-	mainWorktreePath := filepath.Dir(commonDir)
-	resolvedMainWorktreePath, err := filepath.EvalSymlinks(mainWorktreePath)
-	if err != nil {
+	// Only recognize the conventional layout: a non-empty checkout with its
+	// Git directory at <worktree>/.git. Ambiguous layouts fall back to the
+	// current Git top-level.
+	if info, err := os.Stat(filepath.Join(mainWorktreePath, ".git")); err != nil || !info.IsDir() {
 		return "", false
 	}
-	resolvedListedMainWorktreePath, err := filepath.EvalSymlinks(listedMainWorktreePath)
-	if err != nil || resolvedMainWorktreePath != resolvedListedMainWorktreePath {
-		return "", false
-	}
-
-	rootGitDir := filepath.Join(mainWorktreePath, ".git")
-	if info, err := os.Stat(rootGitDir); err != nil || !info.IsDir() {
-		return "", false
-	}
-
-	// A separate Git directory ending in .git is indistinguishable from a
-	// main worktree to `git worktree list`, which reports its parent as the
-	// first worktree. Do not accept a path that only contains Git metadata.
 	entries, err := os.ReadDir(mainWorktreePath)
 	if err != nil {
 		return "", false
 	}
-	containsWorktreeFiles := false
 	for _, entry := range entries {
 		if entry.Name() != ".git" {
-			containsWorktreeFiles = true
-			break
+			return mainWorktreePath, true
 		}
 	}
-	if !containsWorktreeFiles {
-		return "", false
-	}
-
-	resolvedRootGitDir, err := filepath.EvalSymlinks(rootGitDir)
-	if err != nil {
-		return "", false
-	}
-	if resolvedCommonDir != resolvedRootGitDir {
-		return "", false
-	}
-
-	return mainWorktreePath, true
+	return "", false
 }
 
 func configuredWorktreeDir(config *Config) string {
