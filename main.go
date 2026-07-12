@@ -446,6 +446,24 @@ func getMainWorktreePath(repoPath string) (string, bool) {
 		return "", false
 	}
 
+	// A separate Git directory ending in .git is indistinguishable from a
+	// main worktree to `git worktree list`, which reports its parent as the
+	// first worktree. Do not accept a path that only contains Git metadata.
+	entries, err := os.ReadDir(mainWorktreePath)
+	if err != nil {
+		return "", false
+	}
+	containsWorktreeFiles := false
+	for _, entry := range entries {
+		if entry.Name() != ".git" {
+			containsWorktreeFiles = true
+			break
+		}
+	}
+	if !containsWorktreeFiles {
+		return "", false
+	}
+
 	resolvedRootGitDir, err := filepath.EvalSymlinks(rootGitDir)
 	if err != nil {
 		return "", false

@@ -74,6 +74,37 @@ func TestResolveWorktreeDirFallsBackForSeparateGitDir(t *testing.T) {
 	}
 }
 
+func TestResolveWorktreeDirFallsBackFromLinkedWorktreeWithSeparateGitDir(t *testing.T) {
+	parentDir := t.TempDir()
+	checkoutPath := filepath.Join(parentDir, "checkout")
+	gitDir := filepath.Join(parentDir, "metadata", ".git")
+	linkedWorktreePath := filepath.Join(parentDir, "linked")
+	if err := os.MkdirAll(filepath.Dir(gitDir), 0755); err != nil {
+		t.Fatalf("create metadata directory: %v", err)
+	}
+
+	runGit(t, parentDir, "init", "--separate-git-dir="+gitDir, "--initial-branch=master", checkoutPath)
+	runGit(t, checkoutPath, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+		"commit", "--allow-empty", "-m", "init")
+	runGit(t, checkoutPath, "worktree", "add", "-b", "source", linkedWorktreePath)
+
+	worktreePath, err := createWorktree(linkedWorktreePath, "feature", &Config{})
+	if err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+	wantWorktreePath := filepath.Join(linkedWorktreePath, defaultWorktreeDir, "feature")
+	if worktreePath != wantWorktreePath {
+		t.Errorf("worktree path = %q, want %q", worktreePath, wantWorktreePath)
+	}
+	if _, err := os.Stat(wantWorktreePath); err != nil {
+		t.Fatalf("expected linked-worktree-relative path to exist: %v", err)
+	}
+	metadataWorktreePath := filepath.Join(filepath.Dir(gitDir), defaultWorktreeDir, "feature")
+	if _, err := os.Stat(metadataWorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("did not expect worktree under metadata directory: %v", err)
+	}
+}
+
 func TestGetAheadBehindWithContext(t *testing.T) {
 	repoPath := initRepo(t)
 	ctx := context.Background()
