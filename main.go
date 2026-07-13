@@ -35,7 +35,6 @@ const (
 	minViewportHeight    = 5
 	viewportPadding      = 8 // Lines for header/footer
 	hashDisplayLength    = 7
-	branchDisplayWidth   = 20
 	ellipsis             = "..."
 
 	// Git command timeouts
@@ -2704,20 +2703,17 @@ func (m model) View() string {
 				branchSuffix = shortFolderLabel + " │ " + statusAndPR + aheadBehind + " "
 			}
 
-			branchColumnWidth := max(branchDisplayWidth, lipgloss.Width(branchText))
 			if m.ui.width > 0 {
 				// Reserve the cursor, folder cue, and status symbols before sizing the
-				// branch column. These cues stay visible even for long branch names.
+				// branch label. These cues stay visible even for long branch names.
 				available := m.ui.width - lipgloss.Width(cursor) - lipgloss.Width(branchSuffix)
-				branchColumnWidth = max(1, min(branchColumnWidth, available))
+				branchText = truncateToWidth(branchText, max(1, available))
 			}
 
-			branchText = truncateToWidth(branchText, branchColumnWidth)
 			branch := branchStyle.Render(branchText)
 			if wt.IsCurrent {
 				branch = currentStyle.Render(branchText)
 			}
-			branch += strings.Repeat(" ", max(0, branchColumnWidth-lipgloss.Width(branchText)))
 
 			// Commit info
 			commitMsg := truncateString(wt.LastCommit.Message, maxCommitMsgLength)

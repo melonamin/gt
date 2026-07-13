@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -593,6 +594,51 @@ func TestWorktreeViewPlacesPullRequestMarkerAfterBranch(t *testing.T) {
 	}
 }
 
+func TestWorktreeViewUsesCompactBranchSpacing(t *testing.T) {
+	tests := []struct {
+		name        string
+		branch      string
+		isCurrent   bool
+		branchLabel string
+	}{
+		{name: "current default branch", branch: "main", isCurrent: true, branchLabel: "● main"},
+		{name: "normal branch", branch: "fix", branchLabel: "fix"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := model{
+				ui: uiState{width: 120, height: 20},
+				wt: worktreeState{filtered: []Worktree{{
+					Branch:     tt.branch,
+					Path:       "/repo",
+					IsCurrent:  tt.isCurrent,
+					LastCommit: CommitInfo{Message: "commit"},
+				}}},
+				repoPath:        "/repo",
+				mainWorktreeDir: "/repo",
+			}
+
+			line := worktreeDisplayLine(t, m.View(), tt.branchLabel)
+			wantPrefix := "▸ " + tt.branchLabel + " ✓ "
+			if !strings.HasPrefix(line, wantPrefix) {
+				t.Fatalf("worktree line = %q, want compact prefix %q", line, wantPrefix)
+			}
+		})
+	}
+}
+
+func worktreeDisplayLine(t *testing.T, view, branchLabel string) string {
+	t.Helper()
+	for _, line := range strings.Split(ansi.Strip(view), "\n") {
+		if strings.Contains(line, branchLabel) {
+			return line
+		}
+	}
+	t.Fatalf("expected branch label %q in view:\n%s", branchLabel, view)
+	return ""
+}
+
 func TestWorktreeViewKeepsPRMarkerVisibleForLongBranchAndPath(t *testing.T) {
 	branch := strings.Repeat("feature-", 12)
 	m := model{
@@ -611,11 +657,12 @@ func TestWorktreeViewKeepsPRMarkerVisibleForLongBranchAndPath(t *testing.T) {
 		if !strings.Contains(line, pullRequestSymbol) {
 			continue
 		}
-		if !strings.Contains(line, "[📂]") {
-			t.Fatalf("worktree line dropped folder mismatch marker:\n%s", line)
+		displayLine := ansi.Strip(line)
+		if !strings.Contains(displayLine, "... [📂] │ ✓ "+pullRequestSymbol) {
+			t.Fatalf("worktree line dropped truncation, folder, status, or PR syntax:\n%s", displayLine)
 		}
-		if lipgloss.Width(line) > m.ui.width {
-			t.Fatalf("worktree line width = %d, want at most %d:\n%s", lipgloss.Width(line), m.ui.width, line)
+		if lipgloss.Width(displayLine) > m.ui.width {
+			t.Fatalf("worktree line width = %d, want at most %d:\n%s", lipgloss.Width(displayLine), m.ui.width, displayLine)
 		}
 		return
 	}
