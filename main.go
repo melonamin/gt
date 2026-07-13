@@ -1058,14 +1058,14 @@ func fetchWorktreeDetailCmd(wt Worktree, index int, defaultBranch string, genera
 	}
 }
 
-func discoverPullRequestLookupsCmd(repoPath string, worktrees []Worktree, generation int) tea.Cmd {
+func discoverPullRequestLookupsCmd(repoPath string, worktrees []Worktree, defaultBranch string, generation int) tea.Cmd {
 	// Bubble Tea commands run asynchronously. Keep their input independent from
 	// the model's slice, whose worktree details are updated on the main loop.
 	worktreeSnapshot := append([]Worktree(nil), worktrees...)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
 		defer cancel()
-		lookups, err := loadPullRequestLookups(ctx, repoPath, worktreeSnapshot)
+		lookups, err := loadPullRequestLookups(ctx, repoPath, worktreeSnapshot, defaultBranch)
 		return pullRequestLookupsLoadedMsg{
 			lookups:    lookups,
 			generation: generation,
@@ -1181,7 +1181,7 @@ func (m *model) startPullRequestDiscovery() tea.Cmd {
 		return nil
 	}
 	m.wt.prDiscoveryStarted = true
-	return discoverPullRequestLookupsCmd(m.repoPath, m.wt.worktrees, m.wt.prGeneration)
+	return discoverPullRequestLookupsCmd(m.repoPath, m.wt.worktrees, m.wt.defaultBranch, m.wt.prGeneration)
 }
 
 func (m *model) startPullRequestFetch() tea.Cmd {
@@ -1652,6 +1652,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.wt.worktrees = msg.worktrees
 		for i := range m.wt.worktrees {
+			if m.wt.worktrees[i].Branch == msg.defaultBranch {
+				m.wt.worktrees[i].PRState = pullRequestStateNone
+				continue
+			}
 			if state, ok := previousStates[m.wt.worktrees[i].Branch]; ok {
 				m.wt.worktrees[i].PRState = state
 			}
@@ -2087,7 +2091,7 @@ func githubReposForRemotes(remotes []gitRemote) []githubRepo {
 	return repos
 }
 
-func uniquePullRequestLookups(ctx context.Context, repoPath string, worktrees []Worktree, remotes []gitRemote) []pullRequestLookup {
+func uniquePullRequestLookups(ctx context.Context, repoPath string, worktrees []Worktree, remotes []gitRemote, defaultBranch string) []pullRequestLookup {
 	seen := make(map[string]bool)
 	unique := make([]pullRequestLookup, 0, len(worktrees))
 	fallbackRepos := githubReposForRemotes(remotes)
@@ -2096,6 +2100,9 @@ func uniquePullRequestLookups(ctx context.Context, repoPath string, worktrees []
 		branch := strings.TrimSpace(wt.Branch)
 		head := strings.TrimSpace(wt.Head)
 		if branch == "" || head == "" {
+			continue
+		}
+		if defaultBranch != "" && branch == defaultBranch {
 			continue
 		}
 		if upstream := upstreams[branch]; upstream.remote != "" && upstream.headRef != "" {
@@ -2275,12 +2282,12 @@ func fetchPullRequestStates(ctx context.Context, client *http.Client, endpoint, 
 	return resolvedStates, errors.Join(fetchErrors...)
 }
 
-func loadPullRequestLookups(ctx context.Context, repoPath string, worktrees []Worktree) ([]pullRequestLookup, error) {
+func loadPullRequestLookups(ctx context.Context, repoPath string, worktrees []Worktree, defaultBranch string) ([]pullRequestLookup, error) {
 	remotes, err := listGitRemotesWithContext(ctx, repoPath)
 	if err != nil {
 		return nil, err
 	}
-	return uniquePullRequestLookups(ctx, repoPath, worktrees, remotes), nil
+	return uniquePullRequestLookups(ctx, repoPath, worktrees, remotes, defaultBranch), nil
 }
 
 func loadPullRequestStatesForLookups(ctx context.Context, lookups []pullRequestLookup, tokenLookup tokenLookupFunc, client *http.Client) (map[string]pullRequestState, error) {
@@ -2298,8 +2305,8 @@ func loadPullRequestStatesForLookups(ctx context.Context, lookups []pullRequestL
 	return fetchPullRequestStates(ctx, client, githubGraphQLEndpoint, token, lookups)
 }
 
-func loadPullRequestStates(ctx context.Context, repoPath string, worktrees []Worktree, tokenLookup tokenLookupFunc, client *http.Client) (map[string]pullRequestState, error) {
-	lookups, err := loadPullRequestLookups(ctx, repoPath, worktrees)
+func loadPullRequestStates(ctx context.Context, repoPath string, worktrees []Worktree, defaultBranch string, tokenLookup tokenLookupFunc, client *http.Client) (map[string]pullRequestState, error) {
+	lookups, err := loadPullRequestLookups(ctx, repoPath, worktrees, defaultBranch)
 	if err != nil {
 		return nil, err
 	}
