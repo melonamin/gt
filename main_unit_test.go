@@ -421,13 +421,65 @@ func TestLoadPullRequestStatesUsesProvidedTokenLookupWithoutGHBinary(t *testing.
 	}
 }
 
-func TestDefaultTokenLookupPrefersEnvironment(t *testing.T) {
-	t.Setenv("GH_TOKEN", "token-from-env")
-	t.Setenv("GITHUB_TOKEN", "")
+func TestTokenResolverUsesEnvironmentFastPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		env    map[string]string
+		want   string
+		source string
+	}{
+		{
+			name:   "GH_TOKEN takes precedence",
+			env:    map[string]string{"GH_TOKEN": "gh-token", "GITHUB_TOKEN": "github-token"},
+			want:   "gh-token",
+			source: "GH_TOKEN",
+		},
+		{
+			name:   "GITHUB_TOKEN is the second choice",
+			env:    map[string]string{"GITHUB_TOKEN": "github-token"},
+			want:   "github-token",
+			source: "GITHUB_TOKEN",
+		},
+	}
 
-	token, _ := defaultTokenLookup("github.com")
-	if token != "token-from-env" {
-		t.Fatalf("token = %q, want GH_TOKEN value", token)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fallbackCalls := 0
+			resolver := newTokenResolver(func(name string) string {
+				return tt.env[name]
+			}, func(string) (string, string) {
+				fallbackCalls++
+				return "fallback-token", "fallback"
+			})
+
+			token, source := resolver.lookup("github.com")
+			if token != tt.want || source != tt.source {
+				t.Fatal("resolver did not use the expected environment variable")
+			}
+			if fallbackCalls != 0 {
+				t.Fatalf("fallback calls = %d, want 0", fallbackCalls)
+			}
+		})
+	}
+}
+
+func TestTokenResolverReusesSuccessfulLookupInMemory(t *testing.T) {
+	fallbackCalls := 0
+	resolver := newTokenResolver(func(string) string { return "" }, func(string) (string, string) {
+		fallbackCalls++
+		return "resolved-token", "fallback"
+	})
+
+	first, firstSource := resolver.lookup("github.com")
+	second, secondSource := resolver.lookup("github.com")
+	if first != "resolved-token" || firstSource != "fallback" {
+		t.Fatal("first lookup did not use the fallback token")
+	}
+	if second != first || secondSource != "memory" {
+		t.Fatal("second lookup did not reuse the in-memory token")
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("fallback calls = %d, want 1", fallbackCalls)
 	}
 }
 
@@ -484,6 +536,77 @@ func TestWorktreesLoadedRebuildsFilteredAndPreservesPullRequestState(t *testing.
 	}
 }
 
+func TestPullRequestDiscoveryWaitsForWorktreeDetails(t *testing.T) {
+	worktrees := make([]Worktree, maxDetailFetchWorkers+1)
+	for i := range worktrees {
+		worktrees[i] = Worktree{Branch: fmt.Sprintf("branch-%d", i)}
+	}
+	m := model{repoPath: "/repo"}
+
+	updated, _ := m.Update(worktreesLoadedMsg{worktrees: worktrees})
+	m = updated.(model)
+	if m.wt.prDiscoveryStarted {
+		t.Fatal("PR discovery started while initial detail fetches were active")
+	}
+	generation := m.wt.detailGeneration
+
+	updated, _ = m.Update(worktreeDetailLoadedMsg{detail: worktreeDetails{index: 0}, generation: generation - 1})
+	m = updated.(model)
+	if m.wt.prDiscoveryStarted {
+		t.Fatal("stale detail message started PR discovery")
+	}
+
+	for i := range worktrees {
+		updated, _ = m.Update(worktreeDetailLoadedMsg{detail: worktreeDetails{index: i}, generation: generation})
+		m = updated.(model)
+		if i < len(worktrees)-1 && m.wt.prDiscoveryStarted {
+			t.Fatalf("PR discovery started after %d of %d details", i+1, len(worktrees))
+		}
+	}
+	if !m.wt.prDiscoveryStarted {
+		t.Fatal("PR discovery did not start when the detail queue drained")
+	}
+
+	updated, _ = m.Update(worktreesLoadedMsg{worktrees: []Worktree{{Branch: "refreshed"}}})
+	m = updated.(model)
+	if m.wt.prDiscoveryStarted {
+		t.Fatal("refresh did not defer PR discovery for the new detail generation")
+	}
+}
+
+func TestPullRequestDiscoveryStartsWithZeroWorktrees(t *testing.T) {
+	m := model{repoPath: "/repo"}
+
+	updated, _ := m.Update(worktreesLoadedMsg{})
+	m = updated.(model)
+	if !m.wt.prDiscoveryStarted {
+		t.Fatal("PR discovery did not start for an empty worktree list")
+	}
+}
+
+func TestPullRequestDiscoveryDoesNotStartDuringRefresh(t *testing.T) {
+	m := model{
+		repoPath: "/repo",
+		wt: worktreeState{
+			worktrees:        []Worktree{{Branch: "feature"}},
+			detailGeneration: 1,
+		},
+	}
+	m.refreshWorktrees()
+
+	updated, _ := m.Update(worktreeDetailLoadedMsg{detail: worktreeDetails{index: 0}, generation: 1})
+	m = updated.(model)
+	if m.wt.prDiscoveryStarted {
+		t.Fatal("detail completion from the prior generation started PR discovery during refresh")
+	}
+
+	updated, _ = m.Update(worktreesLoadedMsg{})
+	m = updated.(model)
+	if !m.wt.prDiscoveryStarted {
+		t.Fatal("PR discovery did not restart after refresh completed")
+	}
+}
+
 func TestPullRequestFetchRetriesOnlyOnce(t *testing.T) {
 	m := model{
 		repoPath: "/repo",
@@ -509,6 +632,23 @@ func TestPullRequestFetchRetriesOnlyOnce(t *testing.T) {
 	m = updated.(model)
 	if got := m.wt.prFetchAttempts; got != 2 {
 		t.Fatalf("attempts after second failure = %d, want no third attempt", got)
+	}
+}
+
+func TestPullRequestFetchDoesNotRetryMissingCredentials(t *testing.T) {
+	m := model{
+		wt: worktreeState{
+			prGeneration:    1,
+			prFetchAttempts: 1,
+			prLookups:       []pullRequestLookup{{Branch: "feature"}},
+			worktrees:       []Worktree{{Branch: "feature", PRState: pullRequestStatePending}},
+		},
+	}
+
+	updated, _ := m.Update(pullRequestsLoadedMsg{generation: 1, err: errGitHubTokenNotFound})
+	m = updated.(model)
+	if m.wt.prFetchAttempts != 1 {
+		t.Fatalf("fetch attempts = %d, want no retry", m.wt.prFetchAttempts)
 	}
 }
 
