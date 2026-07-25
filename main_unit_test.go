@@ -688,6 +688,23 @@ func TestWorktreeViewDoesNotTruncateBranchWhenThereIsRoom(t *testing.T) {
 	}
 }
 
+func TestWorktreeViewDoesNotTruncateBranchBeforeWindowSize(t *testing.T) {
+	branch := strings.Repeat("feature-", 8)
+	m := model{
+		wt: worktreeState{filtered: []Worktree{{
+			Branch:     branch,
+			Path:       "/repo",
+			LastCommit: CommitInfo{Message: "commit"},
+		}}},
+		repoPath:        "/repo",
+		mainWorktreeDir: "/repo",
+	}
+
+	if view := m.View(); !strings.Contains(view, branch) {
+		t.Fatalf("view truncated branch before receiving window size %q:\n%s", branch, view)
+	}
+}
+
 func TestFetchPullRequestStatesUsesPartialGraphQLData(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body := `{"data":{"repo0":{"pullRequests":{"nodes":[{"state":"OPEN","headRefOid":"abc123","headRepositoryOwner":{"login":"fishy"}}]},"parent":null},"repo1":null},"errors":[{"message":"repository not found"}]}`

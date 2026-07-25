@@ -2703,12 +2703,14 @@ func (m model) View() string {
 				branchSuffix = shortFolderLabel + " │ " + statusAndPR + aheadBehind + " "
 			}
 
+			maxBranchWidth := lipgloss.Width(branchText)
 			if m.ui.width > 0 {
 				// Reserve the cursor, folder cue, and status symbols before sizing the
 				// branch label. These cues stay visible even for long branch names.
 				available := m.ui.width - lipgloss.Width(cursor) - lipgloss.Width(branchSuffix)
-				branchText = truncateToWidth(branchText, max(1, available))
+				maxBranchWidth = max(1, available)
 			}
+			branchText = truncateToWidth(branchText, maxBranchWidth)
 
 			branch := branchStyle.Render(branchText)
 			if wt.IsCurrent {
