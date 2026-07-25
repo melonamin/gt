@@ -136,7 +136,9 @@ type tokenResolver struct {
 	mu       sync.Mutex
 	getenv   func(string) string
 	fallback tokenLookupFunc
-	tokens   map[string]string
+	// gt is a short-lived TUI, and go-gh already caches file-backed auth for
+	// the process. Credential changes intentionally take effect on next launch.
+	tokens map[string]string
 }
 
 func newTokenResolver(getenv func(string) string, fallback tokenLookupFunc) *tokenResolver {
@@ -1640,6 +1642,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.wt.detailQueue = nil
 			m.wt.activeDetailFetches = 0
 			m.setErrorStatus(fmt.Sprintf("Load failed: %v", msg.err), statusMessageTimeout)
+			if pullRequestDiscoveryCmd := m.startPullRequestDiscovery(); pullRequestDiscoveryCmd != nil {
+				return m, tea.Batch(tickCmd(), pullRequestDiscoveryCmd)
+			}
 			return m, tickCmd()
 		}
 		previousStates := make(map[string]pullRequestState, len(m.wt.worktrees))

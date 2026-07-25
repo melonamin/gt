@@ -607,6 +607,32 @@ func TestPullRequestDiscoveryDoesNotStartDuringRefresh(t *testing.T) {
 	}
 }
 
+func TestPullRequestDiscoveryStartsAfterFailedRefresh(t *testing.T) {
+	m := model{
+		repoPath: "/repo",
+		wt: worktreeState{
+			worktrees:        []Worktree{{Branch: "feature"}},
+			detailGeneration: 1,
+		},
+	}
+	m.refreshWorktrees()
+
+	updated, _ := m.Update(worktreeDetailLoadedMsg{detail: worktreeDetails{index: 0}, generation: 1})
+	m = updated.(model)
+	if m.wt.prDiscoveryStarted {
+		t.Fatal("detail completion started PR discovery while refresh was pending")
+	}
+
+	updated, cmd := m.Update(worktreesLoadedMsg{err: fmt.Errorf("refresh failed")})
+	m = updated.(model)
+	if !m.wt.prDiscoveryStarted {
+		t.Fatal("failed refresh left PR discovery unstarted")
+	}
+	if cmd == nil {
+		t.Fatal("failed refresh did not schedule PR discovery")
+	}
+}
+
 func TestPullRequestFetchRetriesOnlyOnce(t *testing.T) {
 	m := model{
 		repoPath: "/repo",
