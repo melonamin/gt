@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -128,8 +129,56 @@ type pullRequestLookup struct {
 
 type tokenLookupFunc func(host string) (token, source string)
 
+var errGitHubTokenNotFound = errors.New("github token not found")
+
+type tokenResolver struct {
+	mu       sync.Mutex
+	getenv   func(string) string
+	fallback tokenLookupFunc
+	// gt is a short-lived TUI, and go-gh already caches file-backed auth for
+	// the process. Credential changes intentionally take effect on next launch.
+	tokens map[string]string
+}
+
+func newTokenResolver(getenv func(string) string, fallback tokenLookupFunc) *tokenResolver {
+	return &tokenResolver{
+		getenv:   getenv,
+		fallback: fallback,
+		tokens:   make(map[string]string),
+	}
+}
+
+func (r *tokenResolver) lookup(host string) (string, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if token := r.tokens[host]; token != "" {
+		return token, "memory"
+	}
+	if r.getenv != nil {
+		if token := r.getenv("GH_TOKEN"); token != "" {
+			r.tokens[host] = token
+			return token, "GH_TOKEN"
+		}
+		if token := r.getenv("GITHUB_TOKEN"); token != "" {
+			r.tokens[host] = token
+			return token, "GITHUB_TOKEN"
+		}
+	}
+	if r.fallback == nil {
+		return "", ""
+	}
+	token, source := r.fallback(host)
+	if token != "" {
+		r.tokens[host] = token
+	}
+	return token, source
+}
+
+var processTokenResolver = newTokenResolver(os.Getenv, auth.TokenForHost)
+
 func defaultTokenLookup(host string) (string, string) {
-	return auth.TokenForHost(host)
+	return processTokenResolver.lookup(host)
 }
 
 // inputMode represents the current input state of the TUI.
@@ -182,6 +231,7 @@ type worktreeState struct {
 	prGeneration        int
 	prFetchAttempts     int
 	prLookups           []pullRequestLookup
+	prDiscoveryStarted  bool
 }
 
 // actionsState holds the state for the actions menu.
@@ -1126,6 +1176,14 @@ func (m *model) startDetailFetches() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+func (m *model) startPullRequestDiscovery() tea.Cmd {
+	if m.wt.loading || m.wt.prDiscoveryStarted || len(m.wt.detailQueue) != 0 || m.wt.activeDetailFetches != 0 {
+		return nil
+	}
+	m.wt.prDiscoveryStarted = true
+	return discoverPullRequestLookupsCmd(m.repoPath, m.wt.worktrees, m.wt.prGeneration)
+}
+
 func (m *model) startPullRequestFetch() tea.Cmd {
 	if m.wt.prFetchAttempts >= maxPullRequestFetchAttempts {
 		return nil
@@ -1583,6 +1641,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.wt.detailQueue = nil
 			m.wt.activeDetailFetches = 0
 			m.setErrorStatus(fmt.Sprintf("Load failed: %v", msg.err), statusMessageTimeout)
+			if pullRequestDiscoveryCmd := m.startPullRequestDiscovery(); pullRequestDiscoveryCmd != nil {
+				return m, tea.Batch(tickCmd(), pullRequestDiscoveryCmd)
+			}
 			return m, tickCmd()
 		}
 		previousStates := make(map[string]pullRequestState, len(m.wt.worktrees))
@@ -1601,6 +1662,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.wt.detailGeneration++
 		m.wt.prGeneration++
 		m.wt.prFetchAttempts = 0
+		m.wt.prDiscoveryStarted = false
 		m.resetDetailQueue()
 		// Find current worktree path for tracking previous (session-only)
 		if m.wt.previousWorktree == "" {
@@ -1615,7 +1677,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if detailCmd := m.startDetailFetches(); detailCmd != nil {
 			cmds = append(cmds, detailCmd)
 		}
-		cmds = append(cmds, discoverPullRequestLookupsCmd(m.repoPath, m.wt.worktrees, m.wt.prGeneration))
+		if pullRequestDiscoveryCmd := m.startPullRequestDiscovery(); pullRequestDiscoveryCmd != nil {
+			cmds = append(cmds, pullRequestDiscoveryCmd)
+		}
 		return m, tea.Batch(cmds...)
 
 	case worktreeDetailLoadedMsg:
@@ -1628,6 +1692,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyWorktreeDetail(msg.detail)
 		if detailCmd := m.startDetailFetches(); detailCmd != nil {
 			return m, tea.Batch(tickCmd(), detailCmd)
+		}
+		if pullRequestDiscoveryCmd := m.startPullRequestDiscovery(); pullRequestDiscoveryCmd != nil {
+			return m, tea.Batch(tickCmd(), pullRequestDiscoveryCmd)
 		}
 		return m, tickCmd()
 
@@ -1652,6 +1719,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.applyPullRequestStates(msg.states)
 		if msg.err != nil {
+			if errors.Is(msg.err, errGitHubTokenNotFound) {
+				return m, tickCmd()
+			}
 			if retryCmd := m.startPullRequestFetch(); retryCmd != nil {
 				return m, tea.Batch(tickCmd(), retryCmd)
 			}
@@ -2222,7 +2292,7 @@ func loadPullRequestStatesForLookups(ctx context.Context, lookups []pullRequestL
 	}
 	token, _ := tokenLookup("github.com")
 	if token == "" {
-		return nil, errors.New("github token not found")
+		return nil, errGitHubTokenNotFound
 	}
 
 	return fetchPullRequestStates(ctx, client, githubGraphQLEndpoint, token, lookups)
