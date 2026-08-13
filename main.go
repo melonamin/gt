@@ -3067,10 +3067,9 @@ func getDefaultBranchWithContext(ctx context.Context, repoPath string) string {
 	output, err := runGitCmd(ctx, repoPath, "symbolic-ref", "refs/remotes/origin/HEAD")
 	if err == nil {
 		ref := strings.TrimSpace(string(output))
-		// refs/remotes/origin/main -> main
-		parts := strings.Split(ref, "/")
-		if len(parts) > 0 {
-			return parts[len(parts)-1]
+		// refs/remotes/origin/release/stable -> release/stable
+		if branch, ok := strings.CutPrefix(ref, "refs/remotes/origin/"); ok && branch != "" {
+			return branch
 		}
 	}
 

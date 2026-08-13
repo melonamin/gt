@@ -279,6 +279,17 @@ func TestGetDefaultBranchWithContext(t *testing.T) {
 	}
 }
 
+func TestGetDefaultBranchWithContextPreservesSlashes(t *testing.T) {
+	repoPath := initRepo(t)
+	runGit(t, repoPath, "branch", "release/stable")
+	runGit(t, repoPath, "update-ref", "refs/remotes/origin/release/stable", "refs/heads/release/stable")
+	runGit(t, repoPath, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/release/stable")
+
+	if got := getDefaultBranchWithContext(context.Background(), repoPath); got != "release/stable" {
+		t.Fatalf("defaultBranch = %q, want release/stable", got)
+	}
+}
+
 func TestCanFastForward(t *testing.T) {
 	repoPath := initRepo(t)
 
