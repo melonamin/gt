@@ -243,6 +243,7 @@ func TestUniquePullRequestLookupsUsesConfiguredRemoteIdentity(t *testing.T) {
 		[]gitRemote{
 			{Name: "canonical", URL: "https://github.com/fishy/gt.git"},
 		},
+		"main",
 	)
 
 	if len(lookups) != 1 {
@@ -269,6 +270,7 @@ func TestUniquePullRequestLookupsDoesNotRequireFallbackHeadMatch(t *testing.T) {
 		repoPath,
 		[]Worktree{{Branch: "feature", Head: "local-diverged-sha"}},
 		[]gitRemote{remote},
+		"main",
 	)
 
 	if len(lookups) != 1 {
@@ -284,6 +286,51 @@ func TestUniquePullRequestLookupsDoesNotRequireFallbackHeadMatch(t *testing.T) {
 	}}
 	if got := mapPullRequestStates(lookups, response)["feature"]; got != pullRequestStateOpen {
 		t.Fatalf("state = %q, want %q for diverged local branch", got, pullRequestStateOpen)
+	}
+}
+
+func TestUniquePullRequestLookupsExcludesDefaultBranch(t *testing.T) {
+	repoPath := initRepo(t)
+	remotes := []gitRemote{{Name: "origin", URL: "https://github.com/fishy/gt.git"}}
+	tests := []struct {
+		name          string
+		worktrees     []Worktree
+		defaultBranch string
+		wantBranches  []string
+	}{
+		{
+			name:          "default excluded",
+			worktrees:     []Worktree{{Branch: "main", Head: "default-sha"}},
+			defaultBranch: "main",
+		},
+		{
+			name:          "non-default included",
+			worktrees:     []Worktree{{Branch: "feature", Head: "feature-sha"}},
+			defaultBranch: "main",
+			wantBranches:  []string{"feature"},
+		},
+		{
+			name: "empty default does not guess or exclude",
+			worktrees: []Worktree{
+				{Branch: "main", Head: "main-sha"},
+				{Branch: "feature", Head: "feature-sha"},
+			},
+			wantBranches: []string{"main", "feature"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lookups := uniquePullRequestLookups(context.Background(), repoPath, tt.worktrees, remotes, tt.defaultBranch)
+			if len(lookups) != len(tt.wantBranches) {
+				t.Fatalf("lookup count = %d, want %d: %#v", len(lookups), len(tt.wantBranches), lookups)
+			}
+			for i, wantBranch := range tt.wantBranches {
+				if lookups[i].Branch != wantBranch {
+					t.Fatalf("lookup %d branch = %q, want %q", i, lookups[i].Branch, wantBranch)
+				}
+			}
+		})
 	}
 }
 
@@ -321,6 +368,7 @@ func TestLoadPullRequestStatesFindsTrackedPRWhenLocalBranchIsAhead(t *testing.T)
 		context.Background(),
 		repoPath,
 		[]Worktree{{Branch: "local-fix", Head: "local-unpushed-sha"}},
+		"main",
 		func(string) (string, string) { return "token", "test" },
 		client,
 	)
@@ -408,6 +456,7 @@ func TestLoadPullRequestStatesUsesProvidedTokenLookupWithoutGHBinary(t *testing.
 		context.Background(),
 		repoPath,
 		[]Worktree{{Branch: "feature", Head: "abc123"}},
+		"main",
 		func(string) (string, string) { return "token", "env" },
 		client,
 	)
@@ -489,7 +538,7 @@ func TestDiscoverPullRequestLookupsCmdSnapshotsWorktrees(t *testing.T) {
 	runGit(t, repoPath, "remote", "add", "origin", "https://github.com/fishy/gt.git")
 	worktrees := []Worktree{{Branch: "feature", Head: "abc123"}}
 
-	cmd := discoverPullRequestLookupsCmd(repoPath, worktrees, 7)
+	cmd := discoverPullRequestLookupsCmd(repoPath, worktrees, "main", 7)
 	worktrees[0].Branch = "mutated-after-command-start"
 	msg := cmd().(pullRequestLookupsLoadedMsg)
 
@@ -631,6 +680,36 @@ func TestPullRequestDiscoveryStartsAfterFailedRefresh(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("failed refresh did not schedule PR discovery")
+	}
+}
+
+func TestWorktreesLoadedClearsPreservedPullRequestStateForDefaultBranch(t *testing.T) {
+	m := model{
+		repoPath: "/repo",
+		wt: worktreeState{
+			worktrees: []Worktree{{Branch: "new-default", PRState: pullRequestStateOpen}},
+		},
+	}
+
+	updated, _ := m.Update(worktreesLoadedMsg{
+		worktrees:     []Worktree{{Branch: "new-default", Head: "abc123"}},
+		defaultBranch: "new-default",
+	})
+	m = updated.(model)
+	if got := m.wt.worktrees[0].PRState; got != pullRequestStateNone {
+		t.Fatalf("default branch PR state = %q, want none", got)
+	}
+	if got := m.wt.filtered[0].PRState; got != pullRequestStateNone {
+		t.Fatalf("filtered default branch PR state = %q, want none", got)
+	}
+
+	updated, _ = m.Update(pullRequestLookupsLoadedMsg{
+		generation: m.wt.prGeneration,
+		err:        fmt.Errorf("discovery failed"),
+	})
+	m = updated.(model)
+	if got := m.wt.worktrees[0].PRState; got != pullRequestStateNone {
+		t.Fatalf("default branch PR state after lookup failure = %q, want none", got)
 	}
 }
 
@@ -967,7 +1046,7 @@ func TestFetchPullRequestStatesKeepsEarlierBatchResultsWhenLaterBatchFails(t *te
 func TestLoadPullRequestStatesSkipsTokenLookupWithoutGitHubCandidates(t *testing.T) {
 	repoPath := initRepo(t)
 	called := false
-	states, err := loadPullRequestStates(context.Background(), repoPath, []Worktree{{Branch: "local", Head: "abc123"}}, func(string) (string, string) {
+	states, err := loadPullRequestStates(context.Background(), repoPath, []Worktree{{Branch: "local", Head: "abc123"}}, "main", func(string) (string, string) {
 		called = true
 		return "", ""
 	}, nil)
