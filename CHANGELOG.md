@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-13
+
+### Changed
+- Pull request information now loads after worktree details and reuses the resolved GitHub token, reducing startup work and avoiding redundant authentication lookups. (#15)
+
+### Fixed
+- Default branches are no longer queried for pull request information, including branch names containing slashes. (#13)
+- Worktree rows now use compact branch spacing while preserving status markers and long branch names. (#14)
+
 ## [0.6.0] - 2026-07-13
 
 ### Added
